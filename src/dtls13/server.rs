@@ -461,7 +461,7 @@ impl State {
             ArrayVec<(NamedGroup, std::ops::Range<usize>), { NamedGroup::supported().len() }>,
         > = None;
         let mut client_supported_groups: Option<ArrayVec<NamedGroup, 4>> = None;
-        let mut client_srtp_profiles: Option<ArrayVec<crate::dtls13::message::SrtpProfileId, 3>> =
+        let mut client_srtp_profiles: Option<crate::dtls12::message::SrtpProfileVec> =
             None;
         let mut client_cookie_data: Option<ArrayVec<u8, 32>> = None;
 

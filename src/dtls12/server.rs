@@ -473,15 +473,11 @@ impl State {
             .into());
         }
 
-        // Select SRTP profile according to server priority: AES256GCM, AES128GCM, then SHA1
+        // Select SRTP profile according to server priority (SrtpProfile::ALL order)
         if let Some(profiles) = client_srtp_profiles {
             // Map client profile ids to SrtpProfile, then pick our preferred
             let mut selected_profile: Option<SrtpProfile> = None;
-            for preferred in [
-                SrtpProfile::AEAD_AES_256_GCM,
-                SrtpProfile::AEAD_AES_128_GCM,
-                SrtpProfile::AES128_CM_SHA1_80,
-            ] {
+            for &preferred in SrtpProfile::ALL {
                 if profiles.iter().any(|pid| preferred == (*pid).into()) {
                     selected_profile = Some(preferred);
                     break;
@@ -1210,11 +1206,7 @@ fn handshake_create_server_hello(
         .cipher_suite()
         .ok_or(Error::InvalidState(crate::InvalidStateError::NoCipherSuite))?;
 
-    let srtp_pid = negotiated_srtp_profile.map(|p| match p {
-        SrtpProfile::AEAD_AES_256_GCM => SrtpProfileId::SRTP_AEAD_AES_256_GCM,
-        SrtpProfile::AEAD_AES_128_GCM => SrtpProfileId::SRTP_AEAD_AES_128_GCM,
-        SrtpProfile::AES128_CM_SHA1_80 => SrtpProfileId::SRTP_AES128_CM_SHA1_80,
-    });
+    let srtp_pid = negotiated_srtp_profile.map(SrtpProfileId::from);
 
     let sh = ServerHello::new(
         server_version,

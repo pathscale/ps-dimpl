@@ -55,9 +55,10 @@ use super::CryptoProvider;
 ///
 /// # Supported Cipher Suites
 ///
-/// - `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (0xC02B)
-/// - `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (0xC02C)
-/// - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA9)
+/// - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA9, RFC 7905)
+/// - `TLS_CHACHA20_POLY1305_SHA256` (DTLS 1.3)
+///
+/// No AES suite is implemented or offered.
 ///
 /// # Supported Key Exchange Groups
 ///

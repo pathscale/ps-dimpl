@@ -29,21 +29,17 @@
 //!   `supported_versions` extension)
 //!
 //! # Cryptography surface
+//! This fork (ps-dimpl) carries no AES on its pure-Rust path.
 //! - **Cipher suites (TLS 1.2 over DTLS)**
-//!   - `ECDHE_ECDSA_AES256_GCM_SHA384`
-//!   - `ECDHE_ECDSA_AES128_GCM_SHA256`
-//!   - `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256`
-//! - **PSK cipher suites (TLS 1.2 over DTLS)**
-//!   - `PSK_AES128_CCM_8`
+//!   - `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256` (RFC 7905)
 //! - **Cipher suites (TLS 1.3 over DTLS)**
-//!   - `TLS_AES_128_GCM_SHA256`
-//!   - `TLS_AES_256_GCM_SHA384`
 //!   - `TLS_CHACHA20_POLY1305_SHA256`
-//! - **AEAD**: AES‑GCM 128/256, ChaCha20‑Poly1305 (no CBC/EtM modes).
+//! - **AEAD**: ChaCha20‑Poly1305 only.
 //! - **Key exchange**: ECDHE (P‑256/P‑384), X25519
 //! - **Signatures**: ECDSA P‑256/SHA‑256, ECDSA P‑384/SHA‑384
-//! - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_AES_256_GCM`,
-//!   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
+//! - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_CHACHA20_POLY1305` ([RFC 5764] negotiation,
+//!   [RFC 7714] AEAD construction with ChaCha20‑Poly1305 in place of AES‑GCM; placeholder profile ID
+//!   until one is registered).
 //! - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
 //!
 //! ## Certificate model
