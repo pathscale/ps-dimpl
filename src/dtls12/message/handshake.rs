@@ -557,10 +557,10 @@ mod tests {
 
     const MESSAGE: &[u8] = &[
         0x01, // MessageType::ClientHello
-        0x00, 0x00, 0x2E, // length
+        0x00, 0x00, 0x2C, // length
         0x00, 0x00, // message_seq
         0x00, 0x00, 0x00, // fragment_offset
-        0x00, 0x00, 0x2E, // fragment_length
+        0x00, 0x00, 0x2C, // fragment_length
         // ClientHello
         0xFE, 0xFD, // ProtocolVersion::DTLS1_2
         // Random
@@ -571,9 +571,8 @@ mod tests {
         0xAA, // SessionId
         0x01, // Cookie length
         0xBB, // Cookie
-        0x00, 0x04, // Dtls12CipherSuites length
-        0xC0, 0x2B, // Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
-        0xC0, 0x2C, // Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+        0x00, 0x02, // Dtls12CipherSuites length
+        0xCC, 0xA9, // Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
         0x01, // CompressionMethods length
         0x00, // CompressionMethod::Null
     ];
@@ -642,8 +641,7 @@ mod tests {
         let session_id = SessionId::try_new(&[0xAA]).unwrap();
         let cookie = Cookie::try_new(&[0xBB]).unwrap();
         let mut cipher_suites = ArrayVec::new();
-        cipher_suites.push(Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256);
-        cipher_suites.push(Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384);
+        cipher_suites.push(Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256);
         let mut compression_methods = ArrayVec::new();
         compression_methods.push(CompressionMethod::Null);
 
@@ -658,10 +656,10 @@ mod tests {
 
         let handshake = Handshake::new(
             MessageType::ClientHello,
-            0x2E,
+            0x2C,
             0,
             0,
-            0x2E,
+            0x2C,
             Body::ClientHello(client_hello),
         );
 
@@ -685,8 +683,7 @@ mod tests {
         let session_id = SessionId::try_new(&[0xAA]).unwrap();
         let cookie = Cookie::try_new(&[0xBB]).unwrap();
         let mut cipher_suites = ArrayVec::new();
-        cipher_suites.push(Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256);
-        cipher_suites.push(Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384);
+        cipher_suites.push(Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256);
         let mut compression_methods = ArrayVec::new();
         compression_methods.push(CompressionMethod::Null);
 
@@ -701,10 +698,10 @@ mod tests {
 
         let handshake = Handshake::new(
             MessageType::ClientHello,
-            46,
+            44,
             0,
             0,
-            46,
+            44,
             Body::ClientHello(client_hello),
         );
 

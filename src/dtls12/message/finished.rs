@@ -35,30 +35,3 @@ impl Finished {
         output.extend_from_slice(self.verify_data(buf));
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::Dtls12CipherSuite;
-    use super::*;
-    use crate::buffer::Buf;
-
-    #[test]
-    fn roundtrip() {
-        let verify_data = vec![
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-        ];
-
-        // Parse the data
-        let (rest, parsed) = Finished::parse(
-            &verify_data,
-            Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
-        )
-        .unwrap();
-        assert!(rest.is_empty());
-
-        // Serialize and compare to original
-        let mut serialized = Buf::new();
-        parsed.serialize(&verify_data, &mut serialized);
-        assert_eq!(&*serialized, &verify_data[..]);
-    }
-}

@@ -1,5 +1,3 @@
-#![no_main]
-
 //! Fuzz target for DTLS 1.3 record layer parsing.
 //!
 //! This target focuses on testing the record parsing logic by constructing
@@ -22,18 +20,22 @@
 //! - Length: 0 or 2 bytes (depending on L flag)
 //! - Fragment: variable
 
-use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 use std::time::Instant;
 
 use dimpl::{Config, Dtls, certificate};
+use dimpl_fuzz::{handle_packet, run};
 
 /// DTLSPlaintext header length
 const PLAINTEXT_HEADER_LEN: usize = 13;
 /// Maximum DTLS fragment size
 const MAX_FRAGMENT_SIZE: usize = 16384;
 
-fuzz_target!(|data: &[u8]| {
+fn main() {
+    run(exercise);
+}
+
+fn exercise(data: &[u8]) {
     let cert = match certificate::generate_self_signed_certificate() {
         Ok(c) => c,
         Err(_) => return,
@@ -44,7 +46,9 @@ fuzz_target!(|data: &[u8]| {
     let mut dtls = Dtls::new_13(Arc::clone(&config), cert, now);
 
     // Test the input as-is (even small inputs exercise error paths)
-    let _ = dtls.handle_packet(data);
+    if !handle_packet(&mut dtls, data) {
+        return;
+    }
 
     // If input is long enough, test with DTLSPlaintext header (epoch 0)
     if !data.is_empty() {
@@ -58,7 +62,9 @@ fuzz_target!(|data: &[u8]| {
         record.extend_from_slice(&(frag_len as u16).to_be_bytes());
         record.extend_from_slice(&data[..frag_len]);
 
-        let _ = dtls.handle_packet(&record);
+        if !handle_packet(&mut dtls, &record) {
+            return;
+        }
     }
 
     // Test with DTLSCiphertext unified header (epoch >= 2)
@@ -76,6 +82,6 @@ fuzz_target!(|data: &[u8]| {
         record.extend_from_slice(&(frag_len as u16).to_be_bytes());
         record.extend_from_slice(&data[..frag_len]);
 
-        let _ = dtls.handle_packet(&record);
+        handle_packet(&mut dtls, &record);
     }
-});
+}

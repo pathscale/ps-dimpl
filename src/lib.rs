@@ -1,4 +1,4 @@
-//! dimpl — DTLS 1.2 and 1.3 implementation (Sans‑IO, Sync)
+//! ps-dimpl: DTLS 1.2 and 1.3 implementation (Sans-IO, Sync)
 //!
 //! dimpl is a DTLS 1.2 and 1.3 implementation aimed at WebRTC. It is a Sans‑IO
 //! state machine you embed into your own UDP/RTC event loop: you feed incoming
@@ -20,16 +20,16 @@
 //!
 //! ## Version selection
 //!
-//! Four constructors control which DTLS version is used:
+//! Three constructors select a usable DTLS version:
 //! - [`Dtls::new_12`][new_12] — explicit DTLS 1.2 (certificate‑based)
-//! - [`Dtls::new_12_psk`][new_12_psk] — explicit DTLS 1.2 (PSK, no certificates)
+
 //! - [`Dtls::new_13`][new_13] — explicit DTLS 1.3
 //! - [`Dtls::new_auto`][new_auto] — auto‑sense: the first
 //!   incoming ClientHello determines the version (based on the
 //!   `supported_versions` extension)
 //!
 //! # Cryptography surface
-//! This fork (ps-dimpl) carries no AES on its pure-Rust path.
+//! ps-dimpl is a fork of algesten/dimpl with pure Rust cryptography and ChaCha20-Poly1305 only.
 //! - **Cipher suites (TLS 1.2 over DTLS)**
 //!   - `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256` (RFC 7905)
 //! - **Cipher suites (TLS 1.3 over DTLS)**
@@ -38,8 +38,8 @@
 //! - **Key exchange**: ECDHE (P‑256/P‑384), X25519
 //! - **Signatures**: ECDSA P‑256/SHA‑256, ECDSA P‑384/SHA‑384
 //! - **DTLS‑SRTP**: Exports keying material for `SRTP_AEAD_CHACHA20_POLY1305` ([RFC 5764] negotiation,
-//!   [RFC 7714] AEAD construction with ChaCha20‑Poly1305 in place of AES‑GCM; placeholder profile ID
-//!   until one is registered).
+//!   a ChaCha20-Poly1305 AEAD profile with a placeholder identifier until registered).
+//!   Peers must agree on this profile.
 //! - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
 //!
 //! ## Certificate model
@@ -90,7 +90,7 @@
 //! # Example (Sans‑IO loop)
 //!
 //! ```rust,no_run
-//! # #[cfg(feature = "rcgen")]
+//! # #[cfg(feature = "rust-crypto")]
 //! # {
 //! use std::sync::Arc;
 //! use std::time::Instant;
@@ -156,36 +156,11 @@
 //! # }
 //! ```
 //!
-//! # Example (PSK client)
+//! # PSK compatibility
 //!
-//! ```rust,no_run
-//! use std::sync::Arc;
-//! use std::time::Instant;
-//!
-//! use dimpl::{Config, Dtls, PskResolver};
-//!
-//! struct MyPsk;
-//!
-//! impl PskResolver for MyPsk {
-//!     fn resolve(&self, identity: &[u8]) -> Option<Vec<u8>> {
-//!         if identity == b"device-01" {
-//!             Some(b"shared-secret-key".to_vec())
-//!         } else {
-//!             None
-//!         }
-//!     }
-//! }
-//!
-//! let config = Arc::new(
-//!     Config::builder()
-//!         .with_psk_client(b"device-01".to_vec(), Arc::new(MyPsk))
-//!         .build()
-//!         .unwrap(),
-//! );
-//!
-//! let mut dtls = Dtls::new_12_psk(config, Instant::now());
-//! dtls.set_active(true); // client role
-//! ```
+//! The PSK API remains available for source compatibility, but this fork has no
+//! PSK cipher suite. Building a configuration with a PSK resolver returns
+//! `ConfigError::PskConfiguredWithoutPskCipherSuite`.
 //!
 //! ### MSRV
 //! Rust 1.85.0
@@ -254,7 +229,6 @@ pub use error::{
 mod config;
 pub use config::{Config, ConfigBuilder, Psk, PskResolver};
 
-#[cfg(feature = "rcgen")]
 pub mod certificate;
 
 pub mod crypto;
@@ -349,7 +323,7 @@ fn client_hello_handshake(packet: &[u8]) -> Option<&[u8]> {
 /// minimum a real DTLS 1.2 ClientHello can carry. A header-only fake
 /// or a CH whose declared length cannot fit a valid 1.2 body fails the
 /// check.
-#[cfg(all(test, feature = "rcgen"))]
+#[cfg(all(test, feature = "rust-crypto"))]
 fn looks_like_client_hello(packet: &[u8]) -> bool {
     let Some(record_body) = client_hello_handshake(packet) else {
         return false;
@@ -474,6 +448,9 @@ impl Dtls {
     }
 
     /// Create a new DTLS 1.2 PSK-only instance (no certificate).
+    ///
+    /// Retained for source compatibility. This fork has no PSK cipher suite,
+    /// so the configuration builder rejects PSK configurations.
     ///
     /// Call [`set_active(true)`](Self::set_active) to switch to client
     /// before the handshake begins. The `config` must have a
@@ -939,23 +916,13 @@ impl fmt::Debug for Output<'_> {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "rcgen")]
+#[cfg(all(test, feature = "rust-crypto"))]
 mod test {
     use std::panic::UnwindSafe;
 
     use crate::certificate::generate_self_signed_certificate;
-    use crate::crypto::Dtls12CipherSuite;
 
     use super::*;
-
-    struct FixedPsk;
-
-    impl PskResolver for FixedPsk {
-        fn resolve(&self, _identity: &[u8]) -> Option<Vec<u8>> {
-            Some(b"0123456789abcdef".to_vec())
-        }
-    }
 
     fn new_instance() -> Dtls {
         let client_cert =
@@ -1058,28 +1025,7 @@ mod test {
     }
 
     #[test]
-    fn test_auto_psk_only_dtls12_uses_dtls12_path() {
-        let cert = generate_self_signed_certificate().expect("Failed to generate cert");
-        let config = Arc::new(
-            Config::builder()
-                .with_psk_client(b"identity".to_vec(), Arc::new(FixedPsk))
-                .dtls12_cipher_suites(&[Dtls12CipherSuite::PSK_AES128_CCM_8])
-                .dtls13_cipher_suites(&[])
-                .build()
-                .expect("PSK-only DTLS 1.2 config should build"),
-        );
 
-        let mut dtls = Dtls::new_auto(config, cert, Instant::now());
-        dtls.set_active(true);
-
-        assert!(dtls.is_active(), "client should become active");
-        assert!(
-            matches!(dtls.inner, Some(Inner::Client12(_))),
-            "PSK-only DTLS 1.2 auto config should reuse the DTLS 1.2 client path"
-        );
-    }
-
-    #[test]
     fn is_send() {
         fn is_send<T: Send>(_t: T) {}
         fn is_sync<T: Sync>(_t: T) {}
@@ -1191,7 +1137,7 @@ mod test {
         body.push(0); // session_id_length = 0
         body.push(0); // cookie_length = 0
         body.extend_from_slice(&[0x00, 0x02]); // cipher_suites_length = 2
-        body.extend_from_slice(&[0xC0, 0x2B]); // one suite (ECDHE_ECDSA_AES128_GCM)
+        body.extend_from_slice(&[0xCC, 0xA9]); // one suite (ECDHE_ECDSA_CHACHA20_POLY1305)
         body.push(1); // compression_methods_length = 1
         body.push(0); // null compression
         body
@@ -1212,7 +1158,7 @@ mod test {
         body.push(0); // legacy_session_id length
         body.push(0); // legacy_cookie length
         body.extend_from_slice(&[0x00, 0x02]); // cipher_suites length
-        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.extend_from_slice(&[0x13, 0x03]); // TLS_CHACHA20_POLY1305_SHA256
         body.push(1); // compression_methods length
         body.push(0); // null compression
 
@@ -1228,7 +1174,7 @@ mod test {
         body.push(0); // session_id length
         body.push(0); // cookie length
         body.extend_from_slice(&[0x00, 0x02]); // cipher_suites length
-        body.extend_from_slice(&[0xC0, 0x2B]); // ECDHE_ECDSA_AES128_GCM_SHA256
+        body.extend_from_slice(&[0xCC, 0xA9]); // ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
         body.push(1); // compression_methods length
         body.push(0); // null compression
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
@@ -1362,7 +1308,7 @@ mod test {
         body.push(0); // session_id_length = 0
         body.push(0); // cookie_length = 0
         body.extend_from_slice(&[0x00, 0x04]); // cipher_suites_length exceeds available suites
-        body.extend_from_slice(&[0xC0, 0x2B]); // 2 bytes that pretend to be a suite
+        body.extend_from_slice(&[0xCC, 0xA9]); // 2 bytes that pretend to be a suite
         body.push(1); // compression_methods_length = 1
         body.push(0); // null compression
         body

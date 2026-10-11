@@ -121,7 +121,7 @@ impl KeyProvider for RustCryptoKeyProvider {
             return Ok(Box::new(EcdsaSigningKey::P384(key)));
         }
 
-        // Try parsing as SEC1 DER format (OpenSSL EC private key format)
+        // Try parsing as SEC1 DER format (EC private key format)
         if let Ok(ec_key) = sec1::EcPrivateKey::try_from(key_der) {
             let private_key_len = ec_key.private_key.len();
 
@@ -287,43 +287,3 @@ pub(super) static KEY_PROVIDER: RustCryptoKeyProvider = RustCryptoKeyProvider;
 
 /// Static instance of the signature verifier.
 pub(super) static SIGNATURE_VERIFIER: RustCryptoSignatureVerifier = RustCryptoSignatureVerifier;
-
-#[cfg(all(test, feature = "rcgen"))]
-mod tests {
-    use super::*;
-    use crate::certificate::generate_self_signed_certificate;
-
-    #[test]
-    fn invalid_signature_returns_structured_verification_error() {
-        let cert = generate_self_signed_certificate().expect("generate cert");
-        let mut key = KEY_PROVIDER
-            .load_private_key(&cert.private_key)
-            .expect("load private key");
-        let data = b"signed data";
-        let mut signature = Buf::new();
-        key.sign(data, HashAlgorithm::SHA256, &mut signature)
-            .expect("sign data");
-
-        let last = signature.len() - 1;
-        signature[last] ^= 0x01;
-
-        let err = SIGNATURE_VERIFIER
-            .verify_signature(
-                &cert.certificate,
-                data,
-                &signature,
-                HashAlgorithm::SHA256,
-                SignatureAlgorithm::ECDSA,
-            )
-            .expect_err("corrupt signature should fail");
-
-        assert_eq!(
-            err,
-            CryptoError::SignatureVerificationFailed {
-                signature: SignatureAlgorithm::ECDSA,
-                hash: HashAlgorithm::SHA256,
-                group: NamedGroup::Secp256r1,
-            }
-        );
-    }
-}

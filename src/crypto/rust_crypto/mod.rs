@@ -15,11 +15,10 @@
 //!
 //! # Usage
 //!
-//! The rust-crypto provider is used automatically as a fallback when aws-lc-rs is not available
-//! or when explicitly specified:
+//! The rust-crypto provider is used automatically or when explicitly specified:
 //!
 //! ```
-//! # #[cfg(feature = "rcgen")]
+//! # #[cfg(feature = "rust-crypto")]
 //! # fn main() {
 //! use std::sync::Arc;
 //! use std::time::Instant;
@@ -35,7 +34,7 @@
 //! );
 //! let dtls = Dtls::new_12(config, cert, Instant::now());
 //! # }
-//! # #[cfg(not(feature = "rcgen"))]
+//! # #[cfg(not(feature = "rust-crypto"))]
 //! # fn main() {}
 //! ```
 
@@ -57,8 +56,6 @@ use super::CryptoProvider;
 ///
 /// - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA9, RFC 7905)
 /// - `TLS_CHACHA20_POLY1305_SHA256` (DTLS 1.3)
-///
-/// No AES suite is implemented or offered.
 ///
 /// # Supported Key Exchange Groups
 ///

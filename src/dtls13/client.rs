@@ -1590,7 +1590,7 @@ impl LocalEvent {
     }
 }
 
-#[cfg(all(test, feature = "rcgen"))]
+#[cfg(all(test, feature = "rust-crypto"))]
 mod tests {
     use std::sync::Arc;
 
@@ -1659,7 +1659,11 @@ mod tests {
         body.extend_from_slice(&ProtocolVersion::DTLS1_2.as_u16().to_be_bytes());
         body.extend_from_slice(&[7; 32]);
         body.push(0); // legacy_session_id
-        body.extend_from_slice(&Dtls13CipherSuite::AES_128_GCM_SHA256.as_u16().to_be_bytes());
+        body.extend_from_slice(
+            &Dtls13CipherSuite::CHACHA20_POLY1305_SHA256
+                .as_u16()
+                .to_be_bytes(),
+        );
         body.push(CompressionMethod::Null.as_u8());
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         body.extend_from_slice(&extensions);

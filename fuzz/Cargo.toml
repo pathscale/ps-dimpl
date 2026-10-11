@@ -4,16 +4,11 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
-[package.metadata]
-cargo-fuzz = true
-
-[dependencies]
-libfuzzer-sys = "0.4"
-
 [dependencies.dimpl]
+package = "ps-dimpl"
 path = ".."
-# Need rcgen to generate certificates for the Dtls instance
-features = ["rcgen"]
+default-features = false
+features = ["rust-crypto"]
 
 [[bin]]
 name = "fuzz_dtls_packet"

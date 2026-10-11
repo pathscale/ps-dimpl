@@ -228,13 +228,7 @@ pub enum CryptoError {
         /// The requested hash algorithm.
         hash: HashAlgorithm,
     },
-    /// An AES-GCM key had the wrong length.
-    InvalidAesGcmKeySize {
-        /// The actual key length in bytes.
-        ///
-        /// Values greater than `u16::MAX` are reported as `u16::MAX`.
-        actual: u16,
-    },
+
     /// A ChaCha20-Poly1305 key had the wrong length.
     InvalidChacha20Poly1305KeySize {
         /// The actual key length in bytes.
@@ -242,13 +236,7 @@ pub enum CryptoError {
         /// Values greater than `u16::MAX` are reported as `u16::MAX`.
         actual: u16,
     },
-    /// An AES-128-CCM-8 key had the wrong length.
-    InvalidAes128Ccm8KeySize {
-        /// The actual key length in bytes.
-        ///
-        /// Values greater than `u16::MAX` are reported as `u16::MAX`.
-        actual: u16,
-    },
+
     /// A nonce was invalid for the selected cipher.
     InvalidNonce,
     /// A ciphertext was shorter than the selected AEAD permits.
@@ -958,15 +946,11 @@ impl fmt::Display for CryptoError {
             Self::SigningKeyUnsupportedHash { group, hash } => {
                 write!(f, "{group:?} key does not support hash algorithm {hash:?}")
             }
-            Self::InvalidAesGcmKeySize { actual } => {
-                write!(f, "invalid key size for AES-GCM: {actual}")
-            }
+
             Self::InvalidChacha20Poly1305KeySize { actual } => {
                 write!(f, "invalid key size for CHACHA20-POLY1305: {actual}")
             }
-            Self::InvalidAes128Ccm8KeySize { actual } => {
-                write!(f, "invalid key size for AES-128-CCM-8: {actual}")
-            }
+
             Self::InvalidNonce => write!(f, "invalid nonce"),
             Self::CiphertextTooShort { minimum, actual } => {
                 write!(f, "ciphertext too short: got {actual}, minimum {minimum}")

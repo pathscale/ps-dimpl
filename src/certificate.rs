@@ -3,10 +3,22 @@
 //! This module provides helpers to generate self-signed certificates suitable for DTLS,
 //! compute fingerprints, and format them for display.
 
-use aws_lc_rs::digest;
-use rand::random;
-use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
+
+use p256::ecdsa::{DerSignature, SigningKey};
+use pkcs8::EncodePrivateKey;
+use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256};
+use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::der::Encode;
+use x509_cert::name::Name;
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::SubjectPublicKeyInfoOwned;
+use x509_cert::time::Validity;
+
+const CERTIFICATE_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Certificate utility error types
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,62 +46,53 @@ impl std::error::Error for CertificateError {}
 pub use crate::DtlsCertificate;
 
 /// Generate a self-signed certificate for DTLS
-///
-/// This function requires the `rcgen` feature to be enabled.
 pub fn generate_self_signed_certificate() -> Result<DtlsCertificate, CertificateError> {
-    // Create a key pair for the certificate
-    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+    let mut rng = OsRng;
+    let signing_key = SigningKey::random(&mut rng);
+    let mut serial = [0u8; 16];
+    rng.try_fill_bytes(&mut serial)
         .map_err(|_| CertificateError::GenerationFailed)?;
+    // RFC 5280 requires a positive, nonzero serial number.
+    serial[0] |= 1;
 
-    // Set up certificate parameters
-    let mut params = CertificateParams::new(Vec::<String>::new())
+    let subject =
+        Name::from_str("CN=DTLS Peer,O=DTLS").map_err(|_| CertificateError::GenerationFailed)?;
+    let public_key = SubjectPublicKeyInfoOwned::from_key(*signing_key.verifying_key())
         .map_err(|_| CertificateError::GenerationFailed)?;
-
-    // Set up distinguished name
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::OrganizationName, "DTLS".to_string());
-    distinguished_name.push(DnType::CommonName, "DTLS Peer".to_string());
-    params.distinguished_name = distinguished_name;
-
-    // Configure as end entity certificate (not a CA)
-    params.is_ca = IsCa::NoCa;
-
-    // Set validity period (1 year)
-    let not_before = time::OffsetDateTime::now_utc();
-    let not_after = not_before + time::Duration::days(365);
-    params.not_before = not_before;
-    params.not_after = not_after;
-
-    // Serial number: must be unique for Firefox compatibility, not only across all certificates
-    // of this process, but also across all certificates of other processes/machines!
-    // See: https://github.com/versatica/mediasoup/issues/127#issuecomment-474460153
-    // and https://github.com/algesten/str0m/issues/517
-    let serial_buf: [u8; 16] = random();
-    params.serial_number = Some(serial_buf.to_vec().into());
-
-    // Build the certificate
-    let cert = params
-        .self_signed(&key_pair)
+    let builder = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: subject.clone(),
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
+        SerialNumber::new(&serial).map_err(|_| CertificateError::GenerationFailed)?,
+        Validity::from_now(CERTIFICATE_LIFETIME).map_err(|_| CertificateError::GenerationFailed)?,
+        subject,
+        public_key,
+        &signing_key,
+    )
+    .map_err(|_| CertificateError::GenerationFailed)?;
+    let certificate = builder
+        .build::<DerSignature>()
+        .map_err(|_| CertificateError::GenerationFailed)?
+        .to_der()
         .map_err(|_| CertificateError::GenerationFailed)?;
-
-    // Get the certificate in DER format
-    let cert_der = cert.der().to_vec();
-
-    // Get the private key in DER format
-    let key_der = key_pair.serialize_der();
+    let private_key = signing_key
+        .to_pkcs8_der()
+        .map_err(|_| CertificateError::GenerationFailed)?
+        .as_bytes()
+        .to_vec();
 
     Ok(DtlsCertificate {
-        certificate: cert_der,
-        private_key: key_der,
+        certificate,
+        private_key,
     })
 }
 
 /// Calculate a certificate fingerprint using SHA-256
-///
-/// This function requires the `rcgen` feature to be enabled.
 pub fn calculate_fingerprint(cert_der: &[u8]) -> Vec<u8> {
     // Use SHA-256 to calculate the fingerprint
-    digest::digest(&digest::SHA256, cert_der).as_ref().to_vec()
+    Sha256::digest(cert_der).to_vec()
 }
 
 /// Format a fingerprint as a colon-separated hex string
@@ -107,8 +110,6 @@ impl DtlsCertificate {
     ///
     /// The fingerprint is computed by hashing the DER-encoded certificate
     /// with SHA-256 and is therefore 32 bytes long.
-    ///
-    /// This method requires the `rcgen` feature to be enabled.
     pub fn fingerprint(&self) -> Vec<u8> {
         calculate_fingerprint(&self.certificate)
     }
@@ -117,8 +118,6 @@ impl DtlsCertificate {
     ///
     /// The string is the SHA-256 fingerprint formatted as uppercase
     /// hex byte pairs separated by colons, for example "AF:12:F6:...".
-    ///
-    /// This method requires the `rcgen` feature to be enabled.
     pub fn fingerprint_str(&self) -> String {
         format_fingerprint(&self.fingerprint())
     }
@@ -151,11 +150,13 @@ mod tests {
         assert_ne!(cert1.fingerprint(), cert2.fingerprint());
 
         // Parse the certificates to verify serial numbers are different
-        use x509_parser::prelude::*;
-        let (_, parsed1) = X509Certificate::from_der(&cert1.certificate).unwrap();
-        let (_, parsed2) = X509Certificate::from_der(&cert2.certificate).unwrap();
+        use der::Decode;
+        use x509_cert::Certificate as X509Certificate;
+        // unwrap: both certificates were generated as valid DER above
+        let parsed1 = X509Certificate::from_der(&cert1.certificate).unwrap();
+        let parsed2 = X509Certificate::from_der(&cert2.certificate).unwrap();
         assert_ne!(
-            parsed1.serial, parsed2.serial,
+            parsed1.tbs_certificate.serial_number, parsed2.tbs_certificate.serial_number,
             "Serial numbers must be unique for Firefox compatibility"
         );
     }

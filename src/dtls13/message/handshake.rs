@@ -540,10 +540,10 @@ mod tests {
 
     const MESSAGE: &[u8] = &[
         0x01, // MessageType::ClientHello
-        0x00, 0x00, 0x2E, // length
+        0x00, 0x00, 0x2C, // length
         0x00, 0x00, // message_seq
         0x00, 0x00, 0x00, // fragment_offset
-        0x00, 0x00, 0x2E, // fragment_length
+        0x00, 0x00, 0x2C, // fragment_length
         // ClientHello
         0xFE, 0xFD, // ProtocolVersion::DTLS1_2 (legacy)
         // Random
@@ -554,9 +554,8 @@ mod tests {
         0xAA, // SessionId
         0x01, // Cookie length
         0xBB, // Cookie
-        0x00, 0x04, // CipherSuites length
-        0x13, 0x01, // AES_128_GCM_SHA256
-        0x13, 0x02, // AES_256_GCM_SHA384
+        0x00, 0x02, // CipherSuites length
+        0x13, 0x03, // CHACHA20_POLY1305_SHA256
         0x01, // CompressionMethods length
         0x00, // Null
     ];
@@ -623,8 +622,7 @@ mod tests {
         let session_id = SessionId::try_new(&[0xAA]).unwrap();
         let cookie = Cookie::try_new(&[0xBB]).unwrap();
         let mut cipher_suites = ArrayVec::new();
-        cipher_suites.push(Dtls13CipherSuite::AES_128_GCM_SHA256);
-        cipher_suites.push(Dtls13CipherSuite::AES_256_GCM_SHA384);
+        cipher_suites.push(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256);
         let mut compression_methods = ArrayVec::new();
         compression_methods.push(CompressionMethod::Null);
 
@@ -639,10 +637,10 @@ mod tests {
 
         let handshake = Handshake::new(
             MessageType::ClientHello,
-            0x2E,
+            0x2C,
             0,
             0,
-            0x2E,
+            0x2C,
             Body::ClientHello(client_hello),
         );
 

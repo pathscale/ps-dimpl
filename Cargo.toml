@@ -1,13 +1,13 @@
 [package]
 name = "ps-dimpl"
 authors = ["Martin Algesten <martin@algesten.se>"]
-description = "DTLS 1.2/1.3 (Sans-IO, Sync), fork of dimpl: RustCrypto backend with ChaCha20-Poly1305 only (RFC 7905 suites, ChaCha20 SRTP profile), no AES"
+description = "DTLS 1.2/1.3 (Sans-IO, Sync), fork of algesten/dimpl: pure Rust, ChaCha20-Poly1305 only"
 version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pathscale/ps-dimpl"
 readme = "README.md"
-keywords = ["dtls", "tls", "webrtc", "psk"]
+keywords = ["dtls", "tls", "webrtc"]
 categories = ["network-programming", "cryptography", "security"]
 
 # MSRV
@@ -19,72 +19,39 @@ name = "dimpl"
 [features]
 default = ["rust-crypto"]
 
-# Default crypto provider
-aws-lc-rs = ["dep:aws-lc-rs", "dep:ccm", "dep:aes", "_crypto-common"]
-
-# Pure Rust crypto provider
+# The only built-in crypto provider. Certificate utilities are always available.
 rust-crypto = [
-            "dep:chacha20poly1305", "dep:chacha20", "dep:p256",
-            "dep:p384", "dep:x25519-dalek", "dep:sha2", "dep:hmac", "dep:hkdf",
-            "dep:ecdsa", "dep:generic-array", "dep:rand_core",
-            "_crypto-common"
+    "dep:chacha20poly1305", "dep:chacha20", "dep:p384", "dep:x25519-dalek",
+    "dep:hmac", "dep:ecdsa", "dep:generic-array", "_crypto-common"
 ]
 
-# Internal for all cryptos
-_crypto-common = ["dep:der", "dep:pkcs8", "dep:sec1", "dep:signature", "dep:spki", "dep:x509-cert"]
-
-# Self-signed certificate generation.
-# rcgen can either use ring or aws-lc-rs. We have decided to use aws-lc-rs to limit the number
-# of crypto libraries we depend upon. If you enable rcgen, you are implicitly also compiling aws-lc-rs.
-# The self-signed certificate comes with a sha256 fingerprint that, where we use aws-lc-rs to compute it.
-# Since we are compiling aws-lc-rs anyway, enabling the feature is no extra cost.
-rcgen = ["dep:rcgen", "aws-lc-rs"]
+# Shared parsing and key-loading support for the provider.
+_crypto-common = ["dep:sec1"]
 
 [dependencies]
 log = "0.4.29"
 nom = { version = "8", default-features = false, features = ["std"] }
 once_cell = "1.21.3"
 rand = "0.9"
-time = { version = "0.3", features = ["formatting"] }
 arrayvec = "0.7.6"
 subtle = "2.6"
 
-der = { version = "0.7", optional = true }
-pkcs8 = { version = "0.10", features = ["pem"], optional = true }
+der = "0.7"
+pkcs8 = { version = "0.10", features = ["pem"] }
 sec1 = { version = "0.7", optional = true }
-signature = { version = "2.2", optional = true }
-spki = { version = "0.7", optional = true }
-x509-cert = { version = "0.2", default-features = false, optional = true }
+signature = "2.2"
+spki = "0.7"
+x509-cert = { version = "0.2", default-features = false, features = ["builder", "std"] }
 
-# aws-lc-rs backend
-aws-lc-rs = { version = "^1.16", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
-
-# RustCrypto backend
-aes-gcm = { version = "0.10", optional = true }
-p256 = { version = "0.13", optional = true, features = ["ecdh"] }
+# RustCrypto backend and unconditional certificate generation.
+p256 = { version = "0.13", features = ["ecdh"] }
 p384 = { version = "0.13", optional = true, features = ["ecdh"] }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", features = ["oid"] }
 hmac = { version = "0.12", optional = true }
-hkdf = { version = "0.12", optional = true }
 ecdsa = { version = "0.16", optional = true, features = ["signing", "verifying"] }
 generic-array = { version = "0.14", optional = true }
-rand_core = { version = "0.6", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
 chacha20poly1305 = { version = "0.10", optional = true }
 chacha20 = { version = "0.9", optional = true }
-ccm = { version = "0.5", default-features = false, optional = true }
-aes = { version = "0.8", optional = true }
 x25519-dalek = { version = "2", optional = true, features = ["static_secrets"] }
 
-# certificate generation
-rcgen = { version = "0.14.7", default-features = false, features = ["aws_lc_rs"], optional = true }
-
-[dev-dependencies]
-openssl = { version = "0.10.75", features = ["vendored"] }
-libc = "0.2"
-env_logger = "0.11.9"
-x509-parser = "0.18"
-bytes = "1"
-
-# wolfssl doesn't build on Windows
-[target.'cfg(not(windows))'.dev-dependencies]
-wolfssl = "7.2.0"

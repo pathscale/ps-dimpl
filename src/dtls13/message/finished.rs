@@ -34,23 +34,3 @@ impl Finished {
         output.extend_from_slice(self.verify_data(buf));
     }
 }
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::buffer::Buf;
-
-    #[test]
-    fn roundtrip() {
-        // SHA-256 verify_data is 32 bytes
-        let verify_data: Vec<u8> = (0..32).collect();
-
-        let (rest, parsed) =
-            Finished::parse(&verify_data, Dtls13CipherSuite::AES_128_GCM_SHA256).unwrap();
-        assert!(rest.is_empty());
-
-        let mut serialized = Buf::new();
-        parsed.serialize(&verify_data, &mut serialized);
-        assert_eq!(&*serialized, &verify_data[..]);
-    }
-}

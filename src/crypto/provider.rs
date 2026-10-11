@@ -26,21 +26,21 @@
 //! To use a custom crypto provider, create one and pass it to the [`Config`](crate::Config):
 //!
 //! ```
-//! # #[cfg(all(feature = "aws-lc-rs", feature = "rcgen"))]
+//! # #[cfg(feature = "rust-crypto")]
 //! # fn main() {
 //! use std::sync::Arc;
 //! use std::time::Instant;
 //! use dimpl::{Config, Dtls, certificate};
-//! use dimpl::crypto::aws_lc_rs;
+//! use dimpl::crypto::rust_crypto;
 //!
 //! let cert = certificate::generate_self_signed_certificate().unwrap();
-//! // Use the default aws-lc-rs provider (implicit)
+//! // Use the default RustCrypto provider (implicit)
 //! let config = Arc::new(Config::default());
 //!
 //! // Or explicitly set the provider
 //! let config = Arc::new(
 //!     Config::builder()
-//!         .with_crypto_provider(aws_lc_rs::default_provider())
+//!         .with_crypto_provider(rust_crypto::default_provider())
 //!         .build()
 //!         .unwrap()
 //! );
@@ -55,7 +55,7 @@
 //!
 //! let dtls = Dtls::new_12(config, cert, Instant::now());
 //! # }
-//! # #[cfg(not(all(feature = "aws-lc-rs", feature = "rcgen")))]
+//! # #[cfg(not(feature = "rust-crypto"))]
 //! # fn main() {}
 //! ```
 //!
@@ -98,7 +98,7 @@
 //!
 //! impl SupportedDtls12CipherSuite for MyDtls12CipherSuite {
 //!     fn suite(&self) -> Dtls12CipherSuite {
-//!         Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+//!         Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256
 //!     }
 //!
 //!     fn hash_algorithm(&self) -> HashAlgorithm {
@@ -106,11 +106,11 @@
 //!     }
 //!
 //!     fn key_lengths(&self) -> (usize, usize, usize) {
-//!         (0, 16, 4) // (mac_key_len, enc_key_len, fixed_iv_len)
+//!         (0, 32, 12) // (mac_key_len, enc_key_len, fixed_iv_len)
 //!     }
 //!
 //!     fn explicit_nonce_len(&self) -> usize {
-//!         8 // AES-GCM: 8-byte explicit nonce per record
+//!         0 // ChaCha20-Poly1305 has no per-record explicit nonce
 //!     }
 //!
 //!     fn tag_len(&self) -> usize {
@@ -131,7 +131,7 @@
 //!
 //! For DTLS 1.2, implementations must support:
 //!
-//! - **Cipher suites**: ECDHE_ECDSA with AES-128-GCM, AES-256-GCM, or CHACHA20_POLY1305
+//! - **Cipher suites**: ECDHE_ECDSA with CHACHA20_POLY1305
 //! - **Key exchange**: ECDHE with X25519, P-256, or P-384 curves
 //! - **Signatures**: ECDSA with P-256/SHA-256 or P-384/SHA-384
 //! - **Hash**: SHA-256 and SHA-384
@@ -225,9 +225,7 @@ pub trait SigningKey: CryptoSafe {
     /// Hash algorithms this key can sign with.
     ///
     /// Used during negotiation to intersect with the peer's offered
-    /// algorithms. Backends that lock the hash at key-load time (e.g.
-    /// aws-lc-rs) return only the locked hash; backends that support
-    /// arbitrary prehash signing (e.g. RustCrypto) may return several.
+    /// algorithms. RustCrypto supports prehash signing with SHA-256 and SHA-384.
     fn supported_hash_algorithms(&self) -> &[HashAlgorithm];
 }
 
@@ -260,7 +258,7 @@ pub trait SupportedDtls12CipherSuite: CryptoSafe {
 
     /// Length in bytes of the per-record explicit nonce (carried in the record body).
     ///
-    /// AES-GCM suites carry an 8-byte explicit nonce; ChaCha20-Poly1305 carries none.
+    /// ChaCha20-Poly1305 carries no explicit nonce.
     fn explicit_nonce_len(&self) -> usize;
 
     /// AEAD authentication tag length in bytes.
@@ -465,7 +463,6 @@ pub trait SupportedDtls13CipherSuite: CryptoSafe {
     /// The mask is XORed over the sequence number bytes in the header.
     /// `sample` is the first 16 bytes of the ciphertext.
     ///
-    /// For AES-based suites: `mask = AES-ECB(sn_key, sample)`.
     ///
     /// For ChaCha20-based suites (RFC 9001 Section 5.4.4):
     /// `counter = sample[0..4]` (LE u32), `nonce = sample[4..16]`,
@@ -481,14 +478,14 @@ pub trait SupportedDtls13CipherSuite: CryptoSafe {
 ///
 /// This struct holds references to all cryptographic components needed
 /// for DTLS. Users can provide custom implementations of each component
-/// to replace the default aws-lc-rs-based provider.
+/// to replace the default RustCrypto provider.
 ///
 /// # Version-Specific Components
 ///
 /// Shared components like `kx_groups`, `signature_verification`, `key_provider`,
 /// `secure_random`, `hash_provider`, and `hmac_provider` are used by both versions.
 /// PRF (TLS 1.2) and HKDF (TLS 1.3) key derivation are built generically on top
-/// of `hmac_provider` — see the [`prf_hkdf`](super::prf_hkdf) module.
+/// of `hmac_provider`; see the [`prf_hkdf`](super::prf_hkdf) module.
 ///
 /// # Design
 ///
@@ -499,12 +496,12 @@ pub trait SupportedDtls13CipherSuite: CryptoSafe {
 /// # Example
 ///
 /// ```
-/// # #[cfg(feature = "aws-lc-rs")]
+/// # #[cfg(feature = "rust-crypto")]
 /// # fn main() {
-/// use dimpl::crypto::{CryptoProvider, aws_lc_rs};
+/// use dimpl::crypto::{CryptoProvider, rust_crypto};
 ///
 /// // Use the default provider
-/// let provider = aws_lc_rs::default_provider();
+/// let provider = rust_crypto::default_provider();
 ///
 /// // Or build a custom one (using defaults for demonstration)
 /// let custom_provider = CryptoProvider {
@@ -521,7 +518,7 @@ pub trait SupportedDtls13CipherSuite: CryptoSafe {
 ///     dtls13_cipher_suites: provider.dtls13_cipher_suites,
 /// };
 /// # }
-/// # #[cfg(not(feature = "aws-lc-rs"))]
+/// # #[cfg(not(feature = "rust-crypto"))]
 /// # fn main() {}
 /// ```
 #[derive(Debug, Clone)]
@@ -555,7 +552,7 @@ pub struct CryptoProvider {
     /// Supported DTLS 1.2 cipher suites (for negotiation).
     ///
     /// These cipher suites bundle key exchange, authentication, encryption,
-    /// and MAC algorithms together (e.g., TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256).
+    /// and MAC algorithms together (e.g., TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256).
     pub cipher_suites: &'static [&'static dyn SupportedDtls12CipherSuite],
 
     // =========================================================================
@@ -564,7 +561,7 @@ pub struct CryptoProvider {
     /// Supported DTLS 1.3 cipher suites (for negotiation).
     ///
     /// TLS 1.3 cipher suites only specify the AEAD and hash algorithms
-    /// (e.g., TLS_AES_128_GCM_SHA256). Key exchange is negotiated separately.
+    /// (e.g., TLS_CHACHA20_POLY1305_SHA256). Key exchange is negotiated separately.
     pub dtls13_cipher_suites: &'static [&'static dyn SupportedDtls13CipherSuite],
 }
 
@@ -588,14 +585,14 @@ impl CryptoProvider {
     /// # Example
     ///
     /// ```
-    /// # #[cfg(feature = "aws-lc-rs")]
+    /// # #[cfg(feature = "rust-crypto")]
     /// # fn main() {
-    /// use dimpl::crypto::{CryptoProvider, aws_lc_rs};
+    /// use dimpl::crypto::{CryptoProvider, rust_crypto};
     ///
     /// // Install a default provider (can only be called once per process)
-    /// CryptoProvider::install_default(aws_lc_rs::default_provider());
+    /// CryptoProvider::install_default(rust_crypto::default_provider());
     /// # }
-    /// # #[cfg(not(feature = "aws-lc-rs"))]
+    /// # #[cfg(not(feature = "rust-crypto"))]
     /// # fn main() {}
     /// ```
     pub fn install_default(provider: CryptoProvider) {
@@ -626,38 +623,28 @@ impl CryptoProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_crypto-common"))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn cert_named_group_p256() {
-        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        let cert = params.self_signed(&key_pair).unwrap();
-
-        let group = cert_named_group(cert.der()).unwrap();
+        // unwrap: the validation fixture is a valid P-256 certificate
+        let group = cert_named_group(include_bytes!("validation/p256_cert.der")).unwrap();
         assert_eq!(group, NamedGroup::Secp256r1);
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn cert_named_group_p384() {
-        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P384_SHA384};
-
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
-        let params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        let cert = params.self_signed(&key_pair).unwrap();
-
-        let group = cert_named_group(cert.der()).unwrap();
+        // unwrap: the validation fixture is a valid P-384 certificate
+        let group = cert_named_group(include_bytes!("validation/p384_cert.der")).unwrap();
         assert_eq!(group, NamedGroup::Secp384r1);
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn cert_named_group_invalid_der() {
         let result = cert_named_group(&[0x00, 0x01, 0x02]);
         assert!(result.is_err());

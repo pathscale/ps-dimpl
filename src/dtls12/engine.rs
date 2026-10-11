@@ -47,7 +47,7 @@ pub struct Engine {
     cipher_suite: Option<Dtls12CipherSuite>,
 
     /// Per-record explicit nonce length, cached from the provider suite at
-    /// `set_cipher_suite` time. 0 for ChaCha20-Poly1305, 8 for AES-GCM.
+    /// `set_cipher_suite` time. Must be 0 for ChaCha20-Poly1305.
     explicit_nonce_len: usize,
 
     /// Minimum length of a protected record's encrypted fragment, cached from
@@ -867,38 +867,22 @@ impl Engine {
             };
 
             let explicit_nonce_len = self.explicit_nonce_len;
-            let mut explicit_nonce = [0u8; DTLSRecord::EXPLICIT_NONCE_LEN];
+            if explicit_nonce_len != 0 {
+                return Err(Error::CryptoError(
+                    crate::CryptoError::UnsupportedDtls12RecordIvLen {
+                        len: bounded_error_len(explicit_nonce_len),
+                        suite,
+                    },
+                ));
+            }
             let seq64 = ((sequence.epoch as u64) << 48) | sequence.sequence_number;
-            let nonce = match explicit_nonce_len {
-                0 => Nonce::xor(iv.as_12_bytes(), seq64),
-                DTLSRecord::EXPLICIT_NONCE_LEN => {
-                    explicit_nonce = self.rng.random();
-                    Nonce::new(iv, &explicit_nonce)
-                }
-                _ => {
-                    return Err(Error::CryptoError(
-                        crate::CryptoError::UnsupportedDtls12RecordIvLen {
-                            len: bounded_error_len(explicit_nonce_len),
-                            suite,
-                        },
-                    ));
-                }
-            };
+            let nonce = Nonce::xor(iv.as_12_bytes(), seq64);
 
             // DTLS 1.2 AEAD: AAD uses the plaintext length (DTLSCompressed.length).
             let aad = Aad::new_dtls12(content_type, sequence, length);
 
             // Encrypt the fragment in-place
             self.encrypt_data(&mut fragment, aad, nonce)?;
-            let ctext_len = fragment.len();
-
-            // For suites with a per-record nonce (e.g. AES-GCM), prefix it on the wire.
-            if explicit_nonce_len > 0 {
-                fragment.resize(explicit_nonce_len + ctext_len, 0);
-                fragment.copy_within(0..ctext_len, explicit_nonce_len);
-                fragment[..explicit_nonce_len]
-                    .copy_from_slice(&explicit_nonce[..explicit_nonce_len]);
-            }
         }
 
         // Build the record structure referencing the (possibly encrypted) fragment
@@ -1243,7 +1227,7 @@ impl Engine {
         }
     }
 
-    pub fn decryption_aad_and_nonce(&self, dtls: &DTLSRecord, buf: &[u8]) -> (Aad, Nonce) {
+    pub fn decryption_aad_and_nonce(&self, dtls: &DTLSRecord, _buf: &[u8]) -> (Aad, Nonce) {
         // DTLS 1.2 AEAD: AAD uses the plaintext length. Recover plaintext length
         // from the record header by subtracting this suite's wire overhead.
         let plaintext_len = dtls
@@ -1252,11 +1236,7 @@ impl Engine {
         let aad = Aad::new_dtls12(dtls.content_type, dtls.sequence, plaintext_len);
         let iv = self.peer_iv();
         let seq64 = ((dtls.sequence.epoch as u64) << 48) | dtls.sequence.sequence_number;
-        let nonce = match self.explicit_nonce_len {
-            0 => Nonce::xor(iv.as_12_bytes(), seq64),
-            DTLSRecord::EXPLICIT_NONCE_LEN => Nonce::new(iv, dtls.nonce(buf)),
-            len => Nonce::new(iv, dtls.nonce_with_len(buf, len)),
-        };
+        let nonce = Nonce::xor(iv.as_12_bytes(), seq64);
         (aad, nonce)
     }
 
@@ -1455,7 +1435,7 @@ impl RecordHandler for Engine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust-crypto"))]
 mod tests {
     use super::*;
 

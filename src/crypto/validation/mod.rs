@@ -18,8 +18,7 @@ impl CryptoProvider {
     /// Returns an iterator over validated cipher suites supported by dimpl.
     ///
     /// Only cipher suites documented in lib.rs are returned:
-    /// - `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`
-    /// - `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
+    ///
     /// - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`
     pub fn supported_cipher_suites(
         &self,
@@ -115,8 +114,7 @@ impl CryptoProvider {
     fn validate_hash_providers(&self) -> Result<Vec<HashAlgorithm>, Error> {
         // Collect unique hash algorithms from supported cipher suites
         let required_hashes: Vec<HashAlgorithm> = self
-            .cipher_suites
-            .iter()
+            .supported_cipher_suites()
             .map(|cs| cs.suite().hash_algorithm())
             .collect();
 
@@ -258,6 +256,11 @@ impl CryptoProvider {
 
         // Verify HKDF (via HMAC) works for each DTLS 1.3 cipher suite's hash algorithm
         for cs in self.dtls13_cipher_suites {
+            if !cs.suite().is_supported() {
+                return Err(provider_error(
+                    CryptoProviderValidationError::NoAeadTestVector(cs.suite()),
+                ));
+            }
             let hash = cs.suite().hash_algorithm();
             let hash_len = hash.output_len();
             let zeros = [0u8; 48];
@@ -494,62 +497,7 @@ struct AeadTestVector {
     ciphertext_tag: &'static [u8], // ciphertext || tag
 }
 
-// NIST SP 800-38D Test Case 3 plaintext (shared by AES-128 and AES-256)
-const GCM_PLAINTEXT: &[u8] = &[
-    0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5, 0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a,
-    0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda, 0x2e, 0x4c, 0x30, 0x3d, 0x8a, 0x31, 0x8a, 0x72,
-    0x1c, 0x3c, 0x0c, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2f, 0xcf, 0x0e, 0x24, 0x49, 0xa6, 0xb5, 0x25,
-    0xb1, 0x6a, 0xed, 0xf5, 0xaa, 0x0d, 0xe6, 0x57, 0xba, 0x63, 0x7b, 0x39, 0x1a, 0xaf, 0xd2, 0x55,
-];
-
 const AEAD_TEST_VECTORS: &[AeadTestVector] = &[
-    // NIST SP 800-38D Test Case 3: AES-128-GCM, empty AAD
-    AeadTestVector {
-        suite: Dtls13CipherSuite::AES_128_GCM_SHA256,
-        key: &[
-            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30,
-            0x83, 0x08,
-        ],
-        nonce: [
-            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88,
-        ],
-        plaintext: GCM_PLAINTEXT,
-        aad: &[],
-        ciphertext_tag: &[
-            // Ciphertext
-            0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24, 0x4b, 0x72, 0x21, 0xb7, 0x84, 0xd0,
-            0xd4, 0x9c, 0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0, 0x35, 0xc1, 0x7e, 0x23,
-            0x29, 0xac, 0xa1, 0x2e, 0x21, 0xd5, 0x14, 0xb2, 0x54, 0x66, 0x93, 0x1c, 0x7d, 0x8f,
-            0x6a, 0x5a, 0xac, 0x84, 0xaa, 0x05, 0x1b, 0xa3, 0x0b, 0x39, 0x6a, 0x0a, 0xac, 0x97,
-            0x3d, 0x58, 0xe0, 0x91, 0x47, 0x3f, 0x59, 0x85, // Tag
-            0x4d, 0x5c, 0x2a, 0xf3, 0x27, 0xcd, 0x64, 0xa6, 0x2c, 0xf3, 0x5a, 0xbd, 0x2b, 0xa6,
-            0xfa, 0xb4,
-        ],
-    },
-    // NIST SP 800-38D Test Case 15: AES-256-GCM, empty AAD
-    AeadTestVector {
-        suite: Dtls13CipherSuite::AES_256_GCM_SHA384,
-        key: &[
-            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30,
-            0x83, 0x08, 0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c, 0x6d, 0x6a, 0x8f, 0x94,
-            0x67, 0x30, 0x83, 0x08,
-        ],
-        nonce: [
-            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88,
-        ],
-        plaintext: GCM_PLAINTEXT,
-        aad: &[],
-        ciphertext_tag: &[
-            // Ciphertext
-            0x52, 0x2d, 0xc1, 0xf0, 0x99, 0x56, 0x7d, 0x07, 0xf4, 0x7f, 0x37, 0xa3, 0x2a, 0x84,
-            0x42, 0x7d, 0x64, 0x3a, 0x8c, 0xdc, 0xbf, 0xe5, 0xc0, 0xc9, 0x75, 0x98, 0xa2, 0xbd,
-            0x25, 0x55, 0xd1, 0xaa, 0x8c, 0xb0, 0x8e, 0x48, 0x59, 0x0d, 0xbb, 0x3d, 0xa7, 0xb0,
-            0x8b, 0x10, 0x56, 0x82, 0x88, 0x38, 0xc5, 0xf6, 0x1e, 0x63, 0x93, 0xba, 0x7a, 0x0a,
-            0xbc, 0xc9, 0xf6, 0x62, 0x89, 0x80, 0x15, 0xad, // Tag
-            0xb0, 0x94, 0xda, 0xc5, 0xd9, 0x34, 0x71, 0xbd, 0xec, 0x1a, 0x50, 0x22, 0x70, 0xe3,
-            0xcc, 0x6c,
-        ],
-    },
     // RFC 7539 §2.8.2: ChaCha20-Poly1305
     AeadTestVector {
         suite: Dtls13CipherSuite::CHACHA20_POLY1305_SHA256,
@@ -604,43 +552,8 @@ struct SnTestVector {
 }
 
 const SN_TEST_VECTORS: &[SnTestVector] = &[
-    // NIST FIPS 197 Appendix B: AES-128-ECB
-    SnTestVector {
-        suite: Dtls13CipherSuite::AES_128_GCM_SHA256,
-        sn_key: &[
-            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
-            0x4f, 0x3c,
-        ],
-        sample: [
-            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
-            0x07, 0x34,
-        ],
-        expected_mask: [
-            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
-            0x0b, 0x32,
-        ],
-        check_len: 16,
-    },
-    // NIST FIPS 197 Appendix C.3: AES-256-ECB
-    SnTestVector {
-        suite: Dtls13CipherSuite::AES_256_GCM_SHA384,
-        sn_key: &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ],
-        sample: [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ],
-        expected_mask: [
-            0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49,
-            0x60, 0x89,
-        ],
-        check_len: 16,
-    },
     // RFC 9001 §A.5: ChaCha20 header protection
-    // Only first 5 bytes are checked (aws-lc-rs zeros bytes 5-15, rust_crypto fills all 16)
+    // RFC 9001 specifies the first 5 bytes of the header protection mask.
     SnTestVector {
         suite: Dtls13CipherSuite::CHACHA20_POLY1305_SHA256,
         sn_key: &[
@@ -661,56 +574,6 @@ const SN_TEST_VECTORS: &[SnTestVector] = &[
 ];
 
 #[cfg(test)]
-#[cfg(feature = "aws-lc-rs")]
-mod tests_aws_lc_rs {
-    use super::*;
-    use crate::crypto::aws_lc_rs;
-    use crate::dtls12::message::Dtls12CipherSuite;
-
-    #[test]
-    fn test_default_provider_validates() {
-        let provider = aws_lc_rs::default_provider();
-        assert!(provider.validate().is_ok());
-    }
-
-    #[test]
-    fn test_default_provider_has_cipher_suites() {
-        let provider = aws_lc_rs::default_provider();
-        let count = provider.supported_cipher_suites().count();
-        // ECDHE: AES-128, AES-256, ChaCha20
-        // PSK: CCM-8
-        assert_eq!(count, 4);
-    }
-
-    #[test]
-    fn test_default_provider_has_kx_groups() {
-        let provider = aws_lc_rs::default_provider();
-        let count = provider.supported_kx_groups().count();
-        assert_eq!(count, 3); // X25519, P-256, and P-384
-    }
-
-    #[test]
-    fn test_default_provider_has_ecdh() {
-        let provider = aws_lc_rs::default_provider();
-        assert!(provider.has_ecdh());
-    }
-
-    #[test]
-    fn test_supported_cipher_suites_for_signature_algorithm() {
-        let provider = aws_lc_rs::default_provider();
-        let ecdsa_suites: Vec<_> = provider
-            .supported_cipher_suites_for_signature_algorithm(SignatureAlgorithm::ECDSA)
-            .map(|cs| cs.suite())
-            .collect();
-
-        assert_eq!(ecdsa_suites.len(), 3);
-        assert!(ecdsa_suites.contains(&Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256));
-        assert!(ecdsa_suites.contains(&Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384));
-        assert!(ecdsa_suites.contains(&Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256));
-    }
-}
-
-#[cfg(test)]
 #[cfg(feature = "rust-crypto")]
 mod tests_rust_crypto {
     use super::*;
@@ -727,9 +590,8 @@ mod tests_rust_crypto {
     fn test_default_provider_has_cipher_suites() {
         let provider = rust_crypto::default_provider();
         let count = provider.supported_cipher_suites().count();
-        // ECDHE: AES-128, AES-256, ChaCha20
-        // PSK: CCM-8
-        assert_eq!(count, 4);
+        // ECDHE with ChaCha20-Poly1305.
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -753,9 +615,7 @@ mod tests_rust_crypto {
             .map(|cs| cs.suite())
             .collect();
 
-        assert_eq!(ecdsa_suites.len(), 3);
-        assert!(ecdsa_suites.contains(&Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256));
-        assert!(ecdsa_suites.contains(&Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384));
+        assert_eq!(ecdsa_suites.len(), 1);
         assert!(ecdsa_suites.contains(&Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256));
     }
 }
