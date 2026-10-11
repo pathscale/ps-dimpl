@@ -1,11 +1,11 @@
 [package]
-name = "dimpl"
+name = "ps-dimpl"
 authors = ["Martin Algesten <martin@algesten.se>"]
-description = "DTLS 1.2/1.3 implementation (Sans‑IO, Sync)"
-version = "0.7.5"
+description = "DTLS 1.2/1.3 (Sans-IO, Sync), fork of dimpl: RustCrypto backend with ChaCha20-Poly1305 only (RFC 7905 suites, ChaCha20 SRTP profile), no AES"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/algesten/dimpl"
+repository = "https://github.com/pathscale/ps-dimpl"
 readme = "README.md"
 keywords = ["dtls", "tls", "webrtc", "psk"]
 categories = ["network-programming", "cryptography", "security"]
@@ -13,18 +13,20 @@ categories = ["network-programming", "cryptography", "security"]
 # MSRV
 rust-version = "1.85.0"
 
+[lib]
+name = "dimpl"
+
 [features]
-default = ["aws-lc-rs", "rcgen"]
+default = ["rust-crypto"]
 
 # Default crypto provider
 aws-lc-rs = ["dep:aws-lc-rs", "dep:ccm", "dep:aes", "_crypto-common"]
 
 # Pure Rust crypto provider
 rust-crypto = [
-            "dep:aes-gcm", "dep:chacha20poly1305", "dep:chacha20", "dep:p256",
+            "dep:chacha20poly1305", "dep:chacha20", "dep:p256",
             "dep:p384", "dep:x25519-dalek", "dep:sha2", "dep:hmac", "dep:hkdf",
             "dep:ecdsa", "dep:generic-array", "dep:rand_core",
-            "dep:ccm", "dep:aes",
             "_crypto-common"
 ]
 

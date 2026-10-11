@@ -12,7 +12,7 @@ pub mod aws_lc_rs;
 #[cfg(feature = "rust-crypto")]
 pub mod rust_crypto;
 
-#[cfg(any(feature = "aws-lc-rs", feature = "rust-crypto"))]
+#[cfg(feature = "aws-lc-rs")]
 pub(crate) mod ccm_cipher;
 
 mod dtls_aead;

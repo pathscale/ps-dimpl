@@ -203,12 +203,12 @@ impl<'a> AsMut<[u8]> for TmpBuf<'a> {
 }
 
 #[cfg(feature = "rust-crypto")]
-impl<'a> aes_gcm::aead::Buffer for TmpBuf<'a> {
-    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), aes_gcm::aead::Error> {
+impl<'a> chacha20poly1305::aead::Buffer for TmpBuf<'a> {
+    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), chacha20poly1305::aead::Error> {
         // Check if there's enough capacity in the underlying slice
         let available = self.0.len() - self.1;
         if available < other.len() {
-            return Err(aes_gcm::aead::Error);
+            return Err(chacha20poly1305::aead::Error);
         }
         // Copy the data into the buffer
         self.0[self.1..self.1 + other.len()].copy_from_slice(other);
@@ -225,8 +225,8 @@ impl<'a> aes_gcm::aead::Buffer for TmpBuf<'a> {
 
 /// Implement the `aead::Buffer` trait for `Buf` to support in-place AEAD operations.
 #[cfg(feature = "rust-crypto")]
-impl aes_gcm::aead::Buffer for Buf {
-    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), aes_gcm::aead::Error> {
+impl chacha20poly1305::aead::Buffer for Buf {
+    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), chacha20poly1305::aead::Error> {
         self.data.extend_from_slice(other);
         Ok(())
     }
