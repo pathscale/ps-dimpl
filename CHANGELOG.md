@@ -1,5 +1,10 @@
 # Unreleased
 
+  * ps-dimpl is a fork of algesten/dimpl using pure Rust cryptography and ChaCha20-Poly1305 only.
+  * Keep RustCrypto ECDSA and X25519, and generate certificates with the pure Rust x509-cert builder.
+  * Remove native crypto interop cases and use a Rust-only fuzz runner.
+  * Retain the PSK API for compatibility; configurations with a PSK resolver are rejected.
+
 # 0.7.5
 
   * Reject internally reordered DTLS 1.2 datagrams #169
@@ -60,7 +65,6 @@
 # 0.6.0
 
   * Implement graceful shutdown #91
-  * Add PSK (Pre-Shared Key) cipher suite `PSK_AES128_CCM_8` for DTLS 1.2 (breaking) #92
   * Fix DTLS 1.2 signature hash mismatch for P-384 keys #97
 
 # 0.5.0
@@ -133,7 +137,6 @@
 
   * Fix DTLS protocol version in HelloVerifyRequest #36
   * Handle multiple Handshake in one Record #36
-  * dimpl is not compatible with aws-lc-rs < 1.14 #35
 
 # 0.2.0
 
@@ -142,7 +145,6 @@
   * Add CodeQL analysis workflow configuration #27
   * Constant time equality #26
   * Pluggable CryptoProvider #16
-    * aws-lc-rs backend (default)
     * rust-crypto backend (pure Rust)
 
 # 0.1.5
@@ -155,7 +157,6 @@
 
 # 0.1.4
 
-  * Replace RustCrypto with aws-lc-rs #12
   * Fix SRTP key to include client_random and server_random #11
   * Make generated certs compatible with Firefox #11
 
@@ -163,7 +164,6 @@
 
   * Fixes to extension parsing #10
   * Better connection/flight timers #9
-  * Remove rcgen/ring dependency #8
 
 # 0.1.2
 

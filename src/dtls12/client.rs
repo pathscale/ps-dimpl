@@ -1348,11 +1348,8 @@ fn handshake_create_client_key_exchange(body: &mut Buf, engine: &mut Engine) -> 
 }
 
 fn handshake_create_certificate_verify(body: &mut Buf, engine: &mut Engine) -> Result<(), Error> {
-    // The hash algorithm to use is the default for the private key type, not
-    // the one negotiated to use with the selected cipher suite. I.e.
-    // if we negotiate ECDHE_ECDSA_AES256_GCM_SHA384, we are gogin to use
-    // SHA384 for the signature of the main crypto, but not for CertificateVerify
-    // where a private key using P256 curve means we use SHA256.
+    // CertificateVerify uses the private key's default hash algorithm.
+    // A P-384 key uses SHA-384 even though the cipher suite uses SHA-256.
     // unwrap: CertificateVerify only sent for certificate-based suites
     let hash_alg = engine
         .crypto_context()
@@ -1409,7 +1406,7 @@ impl LocalEvent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust-crypto"))]
 mod tests {
     use std::sync::Arc;
 
@@ -1474,7 +1471,7 @@ mod tests {
         let mut client = psk_client();
         client
             .engine
-            .set_cipher_suite(Dtls12CipherSuite::PSK_AES128_CCM_8);
+            .set_cipher_suite(Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256);
 
         let err = State::derive_keys(&mut client).expect_err("derive_keys requires server random");
 

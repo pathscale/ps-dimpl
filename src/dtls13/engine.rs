@@ -1066,7 +1066,7 @@ impl Engine {
             .map_err(Error::CryptoError)?;
 
         // Record number encryption (RFC 9147 Section 4.2.3):
-        // mask = AES-ECB(sn_key, ciphertext_sample)
+        // mask = ChaCha20(sn_key, counter, nonce, zero bytes)
         // XOR mask[0..2] over the sequence number bytes in the header
         let sn_mask = if fragment.len() >= 16 {
             // unwrap: we checked length >= 16
@@ -2570,10 +2570,10 @@ impl RecordHandler for Engine {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     use crate::certificate::generate_self_signed_certificate;
 
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn test_engine() -> Engine {
         let cert = generate_self_signed_certificate().expect("gen cert");
         let config = Arc::new(Config::builder().build().expect("build config"));
@@ -2680,7 +2680,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn duplicate_datagram_recycles_its_pooled_buffer() {
         let mut engine = test_engine();
         let packet = encrypted_application_data_record(1, b"buffered ciphertext");
@@ -2713,7 +2713,7 @@ mod tests {
         Incoming::parse_packet(
             &encrypted_key_update_record(seq),
             &mut PassthroughRecordHandler::default(),
-            Some(Dtls13CipherSuite::AES_128_GCM_SHA256),
+            Some(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
         )
         .expect("parse key update packet")
         .expect("packet contains a record")
@@ -2725,7 +2725,7 @@ mod tests {
         Incoming::parse_packet(
             &packet,
             &mut PassthroughRecordHandler::default(),
-            Some(Dtls13CipherSuite::AES_128_GCM_SHA256),
+            Some(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
         )
         .expect("parse coalesced packet")
         .expect("packet contains records")
@@ -2737,7 +2737,7 @@ mod tests {
     /// to exceed MAX_SEQUENCE_NUMBER (2^48 - 1). This test sets the counter
     /// to MAX and verifies that `create_plaintext_record` returns an error.
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn epoch_0_sequence_number_rejects_overflow() {
         let mut engine = test_engine();
 
@@ -2757,10 +2757,10 @@ mod tests {
     /// alongside the traffic secrets, eliminating the need for a separate
     /// `derive_handshake_secret` method.
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn derive_handshake_secrets_returns_handshake_secret() {
         let mut engine = test_engine();
-        engine.set_cipher_suite(Dtls13CipherSuite::AES_128_GCM_SHA256);
+        engine.set_cipher_suite(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256);
 
         // Simulate some transcript content (normally built during handshake)
         engine
@@ -2808,10 +2808,10 @@ mod tests {
     /// via `self.buffers_free.pop()`, reusing pooled allocations instead of
     /// creating a fresh `Buf::new()`.
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn derive_early_secret_uses_buffer_pool() {
         let mut engine = test_engine();
-        engine.set_cipher_suite(Dtls13CipherSuite::AES_128_GCM_SHA256);
+        engine.set_cipher_suite(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256);
 
         // Pre-fill the pool with a buffer that has allocated capacity.
         // BufferPool::push clears contents but retains the allocation.
@@ -2831,7 +2831,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn ack_tracking_full_does_not_panic_on_handshake_replacement() {
         let mut engine = test_engine();
 
@@ -2874,7 +2874,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn ack_tracking_ignores_non_handshake_records_in_coalesced_datagram() {
         let mut engine = test_engine();
 
@@ -2901,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn malformed_ack_record_number_vector_is_ignored() {
         let mut engine = test_engine();
         let fragment = engine.pop_buffer();

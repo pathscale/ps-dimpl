@@ -34,10 +34,10 @@ pub struct CryptoContext {
     /// Server write key
     server_write_key: Option<Buf>,
 
-    /// Client write IV (4 bytes for AES-GCM, 12 bytes for ChaCha20-Poly1305)
+    /// Client write IV (12 bytes for ChaCha20-Poly1305)
     client_write_iv: Option<Iv>,
 
-    /// Server write IV (4 bytes for AES-GCM, 12 bytes for ChaCha20-Poly1305)
+    /// Server write IV (12 bytes for ChaCha20-Poly1305)
     server_write_iv: Option<Iv>,
 
     /// Client MAC key (not used for AEAD ciphers)
@@ -610,12 +610,12 @@ impl CryptoContext {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust-crypto"))]
 mod tests {
     use super::*;
     use crate::Config;
 
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn cert_auth_mode(config: &Config) -> AuthMode {
         let cert = crate::certificate::generate_self_signed_certificate().expect("generate cert");
         let private_key = config
@@ -630,25 +630,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rcgen")]
-    fn certificate_mode_rejects_psk_suites() {
-        let config = Arc::new(Config::default());
-        let auth = cert_auth_mode(&config);
-        let ctx = CryptoContext::new(auth, config);
-
-        for suite in Dtls12CipherSuite::supported() {
-            if suite.is_psk() {
-                assert!(
-                    !ctx.is_cipher_suite_compatible(*suite),
-                    "Certificate-mode context must reject PSK suite {:?}",
-                    suite
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "rcgen")]
+    #[cfg(feature = "rust-crypto")]
     fn certificate_mode_accepts_ecdhe_suites() {
         let config = Arc::new(Config::default());
         let auth = cert_auth_mode(&config);
@@ -678,19 +660,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn psk_mode_accepts_psk_suites() {
-        let config = Arc::new(Config::default());
-        let ctx = CryptoContext::new(AuthMode::Psk, config);
-
-        assert!(
-            Dtls12CipherSuite::supported()
-                .iter()
-                .filter(|s| s.is_psk())
-                .any(|s| ctx.is_cipher_suite_compatible(*s)),
-            "PSK-mode context must accept at least one PSK suite"
-        );
     }
 }

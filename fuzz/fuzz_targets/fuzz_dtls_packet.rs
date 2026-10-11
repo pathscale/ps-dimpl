@@ -1,18 +1,20 @@
-#![no_main]
-
 //! Fuzz target for DTLS packet handling.
 //!
 //! This target exercises the main packet processing path in the DTLS engine.
 //! It creates a DTLS instance and feeds it arbitrary byte sequences to find
 //! parsing bugs, panics, or other issues in packet handling.
 
-use libfuzzer_sys::fuzz_target;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dimpl::{Config, Dtls, Output, certificate};
+use dimpl::{Config, Dtls, certificate};
+use dimpl_fuzz::{drain_outputs, handle_packet, run};
 
-fuzz_target!(|data: &[u8]| {
+fn main() {
+    run(exercise);
+}
+
+fn exercise(data: &[u8]) {
     // Generate a certificate once for the test instance
     let cert = match certificate::generate_self_signed_certificate() {
         Ok(c) => c,
@@ -27,7 +29,7 @@ fuzz_target!(|data: &[u8]| {
     {
         let mut dtls = Dtls::new_12(Arc::clone(&config), cert.clone(), now);
         // Ignore errors - we're looking for panics, not handling errors
-        let _ = dtls.handle_packet(data);
+        handle_packet(&mut dtls, data);
     }
 
     // Test as client
@@ -37,18 +39,12 @@ fuzz_target!(|data: &[u8]| {
         dtls.set_active(true); // Switch to client mode
 
         // Initialize the client by calling handle_timeout to set up the random and other state
-        let mut buf = vec![0u8; 2048];
-        let _ = dtls.handle_timeout(now);
-
-        // Drain any initial packets (ClientHello) with a limit to prevent infinite loops
-        for _ in 0..10 {
-            match dtls.poll_output(&mut buf) {
-                Output::Timeout(_) => break,
-                Output::Packet(_) => continue,
-                _ => break,
-            }
+        let initialized = dtls.handle_timeout(now).is_ok();
+        drain_outputs(&mut dtls);
+        if !initialized {
+            return;
         }
 
-        let _ = dtls.handle_packet(data);
+        handle_packet(&mut dtls, data);
     }
-});
+}

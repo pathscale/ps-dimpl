@@ -1,6 +1,6 @@
 //! Cipher suite implementations using RustCrypto.
 //!
-//! This fork carries no AES: DTLS 1.2 offers only TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (RFC 7905)
+//! DTLS 1.2 offers only TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (RFC 7905)
 //! and DTLS 1.3 only TLS_CHACHA20_POLY1305_SHA256.
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20poly1305::ChaCha20Poly1305 as ChaCha20Poly1305Aead;

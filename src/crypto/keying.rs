@@ -30,9 +30,10 @@ impl std::fmt::Debug for KeyingMaterial {
 #[non_exhaustive]
 /// Supported SRTP protection profiles (RFC 5764 negotiation).
 ///
-/// This fork carries no AES: the only profile is an AEAD over ChaCha20-Poly1305, built exactly like
-/// RFC 7714's AEAD_AES_256_GCM (same packet layout, 12-byte IV from SSRC, index and salt, 16-byte tag)
-/// with the cipher swapped. The DTLS handshake that keys it uses RFC 7905 ChaCha20-Poly1305 suites.
+/// The only profile uses ChaCha20-Poly1305 with a 12-byte IV derived from SSRC,
+/// packet index and salt, and a 16-byte authentication tag. Its wire identifier
+/// is a placeholder until registered. Peers must agree on this profile.
+/// The DTLS handshake that keys it uses RFC 7905 ChaCha20-Poly1305 suites.
 pub enum SrtpProfile {
     /// AEAD_CHACHA20_POLY1305: 32-byte master key, 12-byte master salt.
     CHACHA20_POLY1305,

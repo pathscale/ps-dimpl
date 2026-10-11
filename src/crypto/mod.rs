@@ -6,14 +6,8 @@ use std::ops::Deref;
 mod keying;
 
 // Provider traits and implementations
-#[cfg(feature = "aws-lc-rs")]
-pub mod aws_lc_rs;
-
 #[cfg(feature = "rust-crypto")]
 pub mod rust_crypto;
-
-#[cfg(feature = "aws-lc-rs")]
-pub(crate) mod ccm_cipher;
 
 mod dtls_aead;
 pub mod prf_hkdf;

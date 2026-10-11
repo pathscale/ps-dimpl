@@ -688,16 +688,8 @@ impl fmt::Debug for SignatureScheme {
 pub struct Dtls13CipherSuite(u16);
 
 impl Dtls13CipherSuite {
-    /// TLS_AES_128_GCM_SHA256.
-    pub const AES_128_GCM_SHA256: Self = Self(0x1301);
-    /// TLS_AES_256_GCM_SHA384.
-    pub const AES_256_GCM_SHA384: Self = Self(0x1302);
     /// TLS_CHACHA20_POLY1305_SHA256.
     pub const CHACHA20_POLY1305_SHA256: Self = Self(0x1303);
-    /// TLS_AES_128_CCM_SHA256.
-    pub const AES_128_CCM_SHA256: Self = Self(0x1304);
-    /// TLS_AES_128_CCM_8_SHA256 (shorter tag, for constrained devices).
-    pub const AES_128_CCM_8_SHA256: Self = Self(0x1305);
 
     /// Convert a wire format u16 value to a `Dtls13CipherSuite`.
     pub const fn from_u16(value: u16) -> Self {
@@ -723,11 +715,7 @@ impl Dtls13CipherSuite {
     /// Returns the hash algorithm used by this cipher suite.
     pub fn hash_algorithm(&self) -> HashAlgorithm {
         match *self {
-            Dtls13CipherSuite::AES_128_GCM_SHA256
-            | Dtls13CipherSuite::CHACHA20_POLY1305_SHA256
-            | Dtls13CipherSuite::AES_128_CCM_SHA256
-            | Dtls13CipherSuite::AES_128_CCM_8_SHA256 => HashAlgorithm::SHA256,
-            Dtls13CipherSuite::AES_256_GCM_SHA384 => HashAlgorithm::SHA384,
+            Dtls13CipherSuite::CHACHA20_POLY1305_SHA256 => HashAlgorithm::SHA256,
             _ => HashAlgorithm::UNKNOWN_DERIVED,
         }
     }
@@ -737,24 +725,20 @@ impl Dtls13CipherSuite {
         Self::supported().contains(self)
     }
 
-    /// All recognized DTLS 1.3 cipher suites (every non-`Unknown` variant).
+    /// Recognized wire values, including retired suites that must be rejected.
     pub const fn all() -> &'static [Dtls13CipherSuite] {
         &[
-            Dtls13CipherSuite::AES_128_GCM_SHA256,
-            Dtls13CipherSuite::AES_256_GCM_SHA384,
-            Dtls13CipherSuite::CHACHA20_POLY1305_SHA256,
-            Dtls13CipherSuite::AES_128_CCM_SHA256,
-            Dtls13CipherSuite::AES_128_CCM_8_SHA256,
+            Self(0x1301),
+            Self(0x1302),
+            Self::CHACHA20_POLY1305_SHA256,
+            Self(0x1304),
+            Self(0x1305),
         ]
     }
 
     /// Supported DTLS 1.3 cipher suites in preference order.
     pub const fn supported() -> &'static [Dtls13CipherSuite] {
-        &[
-            Dtls13CipherSuite::AES_128_GCM_SHA256,
-            Dtls13CipherSuite::AES_256_GCM_SHA384,
-            Dtls13CipherSuite::CHACHA20_POLY1305_SHA256,
-        ]
+        &[Dtls13CipherSuite::CHACHA20_POLY1305_SHA256]
     }
 
     /// Length in bytes of verify_data for Finished messages.
@@ -766,11 +750,8 @@ impl Dtls13CipherSuite {
 impl fmt::Debug for Dtls13CipherSuite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Dtls13CipherSuite::AES_128_GCM_SHA256 => f.write_str("AES_128_GCM_SHA256"),
-            Dtls13CipherSuite::AES_256_GCM_SHA384 => f.write_str("AES_256_GCM_SHA384"),
             Dtls13CipherSuite::CHACHA20_POLY1305_SHA256 => f.write_str("CHACHA20_POLY1305_SHA256"),
-            Dtls13CipherSuite::AES_128_CCM_SHA256 => f.write_str("AES_128_CCM_SHA256"),
-            Dtls13CipherSuite::AES_128_CCM_8_SHA256 => f.write_str("AES_128_CCM_8_SHA256"),
+
             _ => f.debug_tuple("Unknown").field(&self.0).finish(),
         }
     }
@@ -1154,8 +1135,8 @@ mod tests {
     #[test]
     fn dtls13_cipher_suite_debug_stays_enum_like() {
         assert_eq!(
-            format!("{:?}", Dtls13CipherSuite::AES_128_GCM_SHA256),
-            "AES_128_GCM_SHA256"
+            format!("{:?}", Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
+            "CHACHA20_POLY1305_SHA256"
         );
         assert_eq!(
             format!("{:?}", Dtls13CipherSuite::from_u16(0xFFFF)),
