@@ -1,14 +1,7 @@
 name: Fuzz
 
 on:
-  push:
-    branches: ['main']
-  pull_request:
-  # Allow manual trigger
   workflow_dispatch:
-  # Run mutation harnesses daily
-  schedule:
-    - cron: '0 0 * * *'
 
 permissions:
   contents: read
