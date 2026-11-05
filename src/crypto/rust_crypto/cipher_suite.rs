@@ -2,7 +2,7 @@
 //!
 //! DTLS 1.2 offers only TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (RFC 7905)
 //! and DTLS 1.3 only TLS_CHACHA20_POLY1305_SHA256.
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::cipher::{KeyIvInit, StreamCipherCore, StreamCipherSeekCore};
 use chacha20poly1305::ChaCha20Poly1305 as ChaCha20Poly1305Aead;
 use chacha20poly1305::aead::AeadInPlace;
 
@@ -154,22 +154,17 @@ impl SupportedDtls13CipherSuite for Tls13ChaCha20Poly1305Sha256 {
     }
 
     fn encrypt_sn(&self, sn_key: &[u8], sample: &[u8; 16]) -> [u8; 16] {
-        // RFC 9001 Section 5.4.4: ChaCha20 header protection
-        // counter = sample[0..4] (LE u32), nonce = sample[4..16]
-        // mask = first 5 bytes of ChaCha20 keystream at given counter
-        // unwrap: the slices are exactly 4 and 12 bytes of a 16-byte array
-        let counter = u32::from_le_bytes(sample[0..4].try_into().unwrap());
-        let nonce: [u8; 12] = sample[4..16].try_into().unwrap();
-
+        let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+        let mut nonce = chacha20::Nonce::default();
+        nonce.copy_from_slice(&sample[4..16]);
+        // sn_key is the internally derived 32-byte record-number key.
         let key = chacha20::Key::from_slice(sn_key);
-        let nonce = chacha20::Nonce::from_slice(&nonce);
-
-        let mut cipher = chacha20::ChaCha20::new(key, nonce);
-        // Seek to the correct block counter position (each block = 64 bytes)
-        cipher.seek(counter as u64 * 64);
-
+        let mut core = chacha20::ChaChaCore::<chacha20::cipher::consts::U10>::new(key, &nonce);
+        core.set_block_pos(counter);
+        let mut block = chacha20::cipher::Block::<chacha20::ChaChaCore<chacha20::cipher::consts::U10>>::default();
+        core.write_keystream_block(&mut block);
         let mut out = [0u8; 16];
-        cipher.apply_keystream(&mut out);
+        out.copy_from_slice(&block[..16]);
         out
     }
 }
