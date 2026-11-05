@@ -10,9 +10,9 @@ pub type SrtpProfileVec = ArrayVec<SrtpProfileId, { SrtpProfileId::supported().l
 
 /// Wire value of the ChaCha20-Poly1305 SRTP profile.
 ///
-/// IANA's DTLS-SRTP registry (RFC 5764, "Specification Required") has no ChaCha20 profile and no
-/// private-use range, so this is a placeholder kept far from the assigned {0x00, 0x..} block. It only has
-/// to agree between peers running this stack; change it here when a profile is registered.
+/// 0xFF01 is a private-use DTLS-SRTP profile identifier under RFC 5764.
+/// It interoperates only with peers implementing this project's profile.
+/// Embedders must refuse media setup when no SRTP profile was negotiated.
 pub const SRTP_AEAD_CHACHA20_POLY1305_ID: u16 = 0xFF01;
 
 /// DTLS-SRTP protection profile identifiers (RFC 5764 Section 4.1.2 framing).
