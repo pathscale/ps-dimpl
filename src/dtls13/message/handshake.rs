@@ -74,6 +74,16 @@ impl Handshake {
         let (input, message_seq) = be_u16(input)?;
         let (input, fragment_offset) = be_u24(input)?;
         let (input, fragment_length) = be_u24(input)?;
+        if fragment_offset
+            .checked_add(fragment_length)
+            .map_or(true, |end| end > length)
+            || (length > 0 && fragment_length == 0)
+        {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
 
         Ok((
             input,

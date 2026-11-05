@@ -353,6 +353,7 @@ impl Engine {
     }
 
     fn insert_incoming(&mut self, incoming: Incoming) -> Result<(), Error> {
+        self.purge_handled_queue_rx();
         if self.queue_rx.len() >= self.config.max_queue_rx() {
             warn!(
                 "Receive queue full (max {}): {:?}",
@@ -613,16 +614,18 @@ impl Engine {
     }
 
     fn purge_handled_queue_rx(&mut self) {
-        while let Some(peek) = self.queue_rx.front() {
-            let fully_handled = peek.records().iter().all(|r| r.is_handled());
-
-            if fully_handled {
-                let incoming = self.queue_rx.pop_front().unwrap();
-                incoming
-                    .into_records()
-                    .for_each(|r| self.buffers_free.push(r.into_buffer()));
+        let mut index = 0;
+        while index < self.queue_rx.len() {
+            if self.queue_rx[index]
+                .records()
+                .iter()
+                .all(|record| record.is_handled())
+            {
+                if let Some(incoming) = self.queue_rx.remove(index) {
+                    self.recycle_incoming(incoming);
+                }
             } else {
-                break;
+                index += 1;
             }
         }
     }
@@ -2361,11 +2364,11 @@ impl RecordHandler for Engine {
             && self.peer_encryption_enabled
             && matches!(
                 record.record().content_type,
-                ContentType::Ack | ContentType::Alert
+                ContentType::Ack | ContentType::Alert | ContentType::Handshake
             )
         {
-            // Plaintext ACKs and alerts after peer encryption is enabled are
-            // unauthenticated and must not be acted on. Mirrors DTLS 1.2.
+            // Plaintext ACKs, alerts and handshakes after peer encryption is
+            // enabled are unauthenticated and must not be acted on.
             self.push_buffer(record.into_buffer());
             return Ok(None);
         }
@@ -2390,6 +2393,9 @@ impl RecordHandler for Engine {
 
                 match description {
                     Some(0) => {
+                        if sequence.epoch == 0 {
+                            return Ok(None);
+                        }
                         self.close_notify_sequence.get_or_insert(sequence);
                         Ok(None)
                     }
