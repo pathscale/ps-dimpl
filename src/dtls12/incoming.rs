@@ -82,7 +82,26 @@ impl Records {
         }
 
         let mut records = ArrayVec::new();
+        let mut seen_ccs = false;
         for record in parsed_records {
+            let epoch = record.record().sequence.epoch;
+            let is_ccs = {
+                let header = record.record();
+                let fragment = header.fragment(record.buffer());
+                header.content_type == ContentType::ChangeCipherSpec
+                    && epoch == 0
+                    && fragment == &[1_u8]
+            };
+            if !decrypt.is_peer_encryption_enabled()
+                && !seen_ccs
+                && epoch > 0
+            {
+                // Future-epoch records cannot yet be authenticated. Keep a
+                // record only when this datagram first carries a valid CCS.
+                decrypt.push_buffer(record.into_buffer());
+                continue;
+            }
+            seen_ccs |= is_ccs;
             if let Some(record) = decrypt.classify_record(record)? {
                 records
                     .try_push(record)
