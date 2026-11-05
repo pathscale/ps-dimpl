@@ -971,6 +971,11 @@ impl State {
         };
 
         if certificate.certificate_list.is_empty() {
+            if server.engine.config().require_client_certificate() {
+                return Err(Error::CertificateError(
+                    crate::CertificateError::NoClientCertificateForVerification,
+                ).into());
+            }
             debug!("Client sent empty certificate list");
             drop(maybe);
             server.engine.advance_peer_handshake_seq();

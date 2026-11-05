@@ -720,7 +720,12 @@ impl State {
         drop(maybe);
 
         if cert_ranges.is_empty() {
-            // Client didn't provide a certificate (allowed), skip
+            if server.engine.config().require_client_certificate() {
+                return Err(Error::CertificateError(
+                    crate::CertificateError::NoClientCertificateForVerification,
+                ).into());
+            }
+            // Optional client authentication permits an empty certificate list.
         } else {
             // Store and verify via callback
             debug!(
