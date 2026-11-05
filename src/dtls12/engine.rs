@@ -375,10 +375,7 @@ impl Engine {
         match search_result {
             Err(index) => self.queue_rx.insert(index, incoming),
             Ok(_) => {
-                // For epoch 0, we can get duplicates due to resends.
-                // For epoch 1, we have the replay window and there should
-                // be no duplicates.
-                assert_eq!(seq_current.epoch, 0);
+                // Reordered pre-CCS datagrams may duplicate future-epoch records.
                 self.recycle_incoming(incoming);
             }
         }
