@@ -1,12 +1,14 @@
+use std::collections::VecDeque;
 use std::mem;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 
 use super::queue::{QueueRx, QueueTx};
 use crate::buffer::{Buf, BufferPool, TmpBuf};
+use crate::crypto::prf_hkdf;
 use crate::crypto::Aad;
 use crate::crypto::Cipher;
 use crate::crypto::HmacProvider;
@@ -14,7 +16,6 @@ use crate::crypto::Nonce;
 use crate::crypto::SigningKey;
 use crate::crypto::SupportedDtls13CipherSuite;
 use crate::crypto::SupportedKxGroup;
-use crate::crypto::prf_hkdf;
 use crate::dtls13::incoming::{Incoming, Record, RecordHandler};
 use crate::dtls13::message::Body;
 use crate::dtls13::message::ContentType;
@@ -54,6 +55,9 @@ pub struct Engine {
 
     /// Queue of incoming packets.
     queue_rx: QueueRx,
+
+    /// Raw epoch-2 records held until peer handshake keys are active.
+    pending_epoch2: VecDeque<Buf>,
 
     /// Queue of outgoing packets.
     queue_tx: QueueTx,
@@ -232,6 +236,7 @@ impl Engine {
             buffers_free,
             sequence_epoch_0: Sequence::new(0),
             queue_rx: QueueRx::new(),
+            pending_epoch2: VecDeque::new(),
             queue_tx: QueueTx::new(),
             cipher_suite: None,
             hs_send_keys: None,
@@ -344,9 +349,21 @@ impl Engine {
 
     pub fn parse_packet(&mut self, packet: &[u8]) -> Result<(), InternalError> {
         let cs = self.cipher_suite;
-        let incoming = Incoming::parse_packet(packet, self, cs)?;
+        let (incoming, pending) = Incoming::parse_packet(packet, self, cs)?;
         if let Some(incoming) = incoming {
-            self.insert_incoming(incoming)?;
+            if let Err(error) = self.insert_incoming(incoming) {
+                for buf in pending {
+                    self.push_buffer(buf);
+                }
+                return Err(error.into());
+            }
+        }
+        for buf in pending {
+            if self.pending_epoch2.len() < self.config.max_queue_rx() {
+                self.pending_epoch2.push_back(buf);
+            } else {
+                self.push_buffer(buf);
+            }
         }
 
         Ok(())
@@ -491,8 +508,7 @@ impl Engine {
             Err(index) => self.queue_rx.insert(index, incoming),
             Ok(_) => {
                 // Duplicate - silently drop. For encrypted records (epoch >= 2) the replay
-                // window filters most duplicates, but undecrypted ciphertext records can
-                // reach here before enable_peer_encryption is called.
+                // window filters most duplicates.
                 self.recycle_incoming(incoming);
             }
         }
@@ -592,7 +608,10 @@ impl Engine {
             .queue_rx
             .iter()
             .flat_map(|i| i.records().iter())
-            .filter(|r| r.record().content_type == ContentType::ApplicationData)
+            .filter(|r| {
+                r.record().content_type == ContentType::ApplicationData
+                    && r.record().sequence.epoch >= 3
+            })
             .skip_while(|r| r.is_handled());
 
         let Some(next) = unhandled.next() else {
@@ -1961,7 +1980,7 @@ impl Engine {
             fragment.extend_from_slice(&msg_seq.to_be_bytes()); // message_seq
             fragment.extend_from_slice(&0u32.to_be_bytes()[1..]); // fragment_offset = 0
             fragment.extend_from_slice(&1u32.to_be_bytes()[1..]); // fragment_length = 1
-            // Body: 1 byte
+                                                                  // Body: 1 byte
             fragment.push(request.as_u8());
         })?;
 
@@ -2162,26 +2181,21 @@ impl Engine {
     pub fn enable_peer_encryption(&mut self) -> Result<(), InternalError> {
         debug!("Peer encryption enabled");
         self.peer_encryption_enabled = true;
-
-        // Re-parse any buffered epoch 2+ records
-        let maybe_index = self
-            .queue_rx
-            .iter()
-            .position(|i| i.records().iter().any(|r| r.record().sequence.epoch >= 2));
-
-        let Some(index) = maybe_index else {
-            return Ok(());
-        };
-
-        let all = self.queue_rx.split_off(index);
-
-        for incoming in all {
-            let unhandled = incoming.into_records().filter(|r| !r.is_handled());
-
-            for record in unhandled {
-                let buf = record.into_buffer();
-                self.parse_packet(&buf)?;
-                self.buffers_free.push(buf);
+        let cs = self.cipher_suite;
+        while let Some(buf) = self.pending_epoch2.pop_front() {
+            let result = (|| -> Result<(), InternalError> {
+                if let Some(record) = Record::decode_owned(buf, self, cs)? {
+                    if let Some(record) = self.classify_record(record)? {
+                        self.insert_incoming(Incoming::single(record))?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                while let Some(buf) = self.pending_epoch2.pop_front() {
+                    self.push_buffer(buf);
+                }
+                return Err(error);
             }
         }
 
@@ -2360,6 +2374,10 @@ impl RecordHandler for Engine {
         }
 
         let epoch = record.record().sequence.epoch;
+        if record.record().content_type == ContentType::ApplicationData && epoch < 3 {
+            self.push_buffer(record.into_buffer());
+            return Ok(None);
+        }
         if epoch == 0
             && self.peer_encryption_enabled
             && matches!(
@@ -2376,9 +2394,9 @@ impl RecordHandler for Engine {
         match record.record().content_type {
             ContentType::Ack => {
                 let fragment = record.record().fragment(record.buffer());
-                self.process_ack(fragment)?;
+                let result = self.process_ack(fragment);
                 self.push_buffer(record.into_buffer());
-                Ok(None)
+                result.map(|()| None)
             }
             ContentType::Alert => {
                 // RFC 8446 §6: TLS 1.3 ignores the AlertLevel byte; severity is
@@ -2608,8 +2626,8 @@ mod tests {
             true
         }
 
-        fn resolve_epoch(&self, _epoch_bits: u8) -> u16 {
-            2
+        fn resolve_epoch(&self, epoch_bits: u8) -> u16 {
+            u16::from(epoch_bits)
         }
 
         fn resolve_sequence(&self, _epoch: u16, seq_bits: u64, _s_flag: bool) -> u64 {
@@ -2677,7 +2695,7 @@ mod tests {
             0b0010_0000
                 | 0b0000_1000 // 2-byte sequence number.
                 | 0b0000_0100 // explicit length.
-                | 0b0000_0010, // epoch bits resolved by PassthroughRecordHandler.
+                | 0b0000_0011, // epoch bits resolved by PassthroughRecordHandler.
         );
         packet.extend_from_slice(&seq.to_be_bytes());
         packet.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
@@ -2687,10 +2705,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "rust-crypto")]
-    fn duplicate_datagram_recycles_its_pooled_buffer() {
+    fn pre_activation_ciphertext_stays_out_of_the_normal_queue() {
         let mut engine = test_engine();
-        let packet = encrypted_application_data_record(1, b"buffered ciphertext");
-        engine.parse_packet(&packet).expect("queue first datagram");
+        let mut packet = encrypted_application_data_record(1, b"buffered ciphertext");
+        packet[0] = (packet[0] & !0x03) | 0x02;
+        engine.parse_packet(&packet).expect("stage first candidate");
         let mut output = [0u8; 2048];
         assert!(matches!(
             engine.poll_output(&mut output, Instant::now()),
@@ -2701,9 +2720,48 @@ mod tests {
         buffer.resize(2048, 0xAA);
         engine.push_buffer(buffer);
 
+        engine.parse_packet(&packet).expect("stage retransmission");
+        assert!(matches!(
+            engine.poll_output(&mut output, Instant::now()),
+            Output::Timeout(_)
+        ));
+        assert!(engine.queue_rx.is_empty());
+        assert_eq!(engine.pending_epoch2.len(), 2);
+        assert!(
+            engine
+                .pending_epoch2
+                .iter()
+                .all(|buf| buf.as_ref() == packet),
+            "raw candidates must stay intact until activation"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn duplicate_plaintext_handshake_recycles_its_pooled_buffer() {
+        let mut engine = test_engine();
+        let key_update = encrypted_key_update_record(0);
+        let handshake = &key_update[5..key_update.len() - 1];
+        let mut packet = vec![ContentType::Handshake.as_u8(), 0xFE, 0xFD];
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0u64.to_be_bytes()[2..]);
+        packet.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        packet.extend_from_slice(handshake);
+
+        engine.parse_packet(&packet).expect("queue first handshake");
+        let mut output = [0u8; 2048];
+        assert!(matches!(
+            engine.poll_output(&mut output, Instant::now()),
+            Output::Timeout(_)
+        ));
+        assert_eq!(engine.queue_rx.len(), 1);
+
+        let mut buffer = engine.pop_buffer();
+        buffer.resize(2048, 0xAA);
+        engine.push_buffer(buffer);
         engine
             .parse_packet(&packet)
-            .expect("discard duplicate datagram");
+            .expect("discard duplicate handshake");
         assert!(matches!(
             engine.poll_output(&mut output, Instant::now()),
             Output::Timeout(_)
@@ -2716,25 +2774,27 @@ mod tests {
     }
 
     fn parsed_key_update(seq: u16) -> Incoming {
-        Incoming::parse_packet(
+        let (incoming, pending) = Incoming::parse_packet(
             &encrypted_key_update_record(seq),
             &mut PassthroughRecordHandler::default(),
             Some(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
         )
-        .expect("parse key update packet")
-        .expect("packet contains a record")
+        .expect("parse key update packet");
+        assert!(pending.is_empty());
+        incoming.expect("packet contains a record")
     }
 
     fn parsed_key_update_with_app_data(key_update_seq: u16, app_seq: u16) -> Incoming {
         let mut packet = encrypted_key_update_record(key_update_seq);
         packet.extend_from_slice(&encrypted_application_data_record(app_seq, b"app-data"));
-        Incoming::parse_packet(
+        let (incoming, pending) = Incoming::parse_packet(
             &packet,
             &mut PassthroughRecordHandler::default(),
             Some(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
         )
-        .expect("parse coalesced packet")
-        .expect("packet contains records")
+        .expect("parse coalesced packet");
+        assert!(pending.is_empty());
+        incoming.expect("packet contains records")
     }
 
     /// Issue 2: Epoch-0 sequence number must have an overflow guard.

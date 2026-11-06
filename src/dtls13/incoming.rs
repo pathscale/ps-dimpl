@@ -8,6 +8,10 @@ use crate::buffer::{Buf, TmpBuf};
 use crate::dtls13::message::{ContentType, Dtls13CipherSuite, Dtls13Record, Handshake, Sequence};
 use crate::{Error, InternalError};
 
+const MAX_DATAGRAM_RECORDS: usize = 16;
+pub type PacketRecords = ArrayVec<Record, MAX_DATAGRAM_RECORDS>;
+pub type PendingRecords = ArrayVec<Buf, MAX_DATAGRAM_RECORDS>;
+
 /// Holds both the UDP packet and the parsed result of that packet.
 pub struct Incoming {
     // Box is here to reduce the size of the Incoming struct
@@ -41,133 +45,130 @@ impl Incoming {
     /// Will surface parser errors.
     pub fn parse_packet(
         packet: &[u8],
-        decrypt: &mut dyn RecordHandler,
+        handler: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
-    ) -> Result<Option<Self>, InternalError> {
-        // Parse records directly from packet, copying each record ONCE into its own buffer
-        let records = Records::parse(packet, decrypt, cs)?;
-
-        // We need at least one Record to be valid. For replayed frames, we discard
-        // the records, hence this might be None
-        if records.records.is_empty() {
-            return Ok(None);
+    ) -> Result<(Option<Self>, PendingRecords), InternalError> {
+        let frames = frame_packet(packet)?;
+        let active = handler.is_peer_encryption_enabled();
+        let mut pending = PendingRecords::new();
+        let mut decoded = PacketRecords::new();
+        for wire in frames {
+            let protected = Dtls13Record::is_ciphertext_header(wire[0]);
+            if protected && !active {
+                if wire[0] & 0x03 == 2 {
+                    let mut buf = handler.pop_buffer();
+                    buf.extend_from_slice(wire);
+                    pending.push(buf);
+                }
+                continue;
+            }
+            let mut buf = handler.pop_buffer();
+            buf.extend_from_slice(wire);
+            match Record::decode_owned(buf, handler, cs) {
+                Ok(Some(record)) => decoded.push(record),
+                Ok(None) => {}
+                Err(error) => {
+                    for record in decoded {
+                        handler.push_buffer(record.into_buffer());
+                    }
+                    for buf in pending {
+                        handler.push_buffer(buf);
+                    }
+                    return Err(error);
+                }
+            }
         }
 
-        let records = Box::new(records);
-
-        Ok(Some(Incoming { records }))
+        let mut retained = PacketRecords::new();
+        let mut decoded = decoded.into_iter();
+        while let Some(record) = decoded.next() {
+            match handler.classify_record(record) {
+                Ok(Some(record)) => retained.push(record),
+                Ok(None) => {}
+                Err(error) => {
+                    // The classifier owns and recycles the current record on Err.
+                    for record in retained.into_iter().chain(decoded) {
+                        handler.push_buffer(record.into_buffer());
+                    }
+                    for buf in pending {
+                        handler.push_buffer(buf);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        let incoming = if retained.is_empty() {
+            None
+        } else {
+            Some(Self {
+                records: Box::new(Records { records: retained }),
+            })
+        };
+        Ok((incoming, pending))
     }
+
+    pub fn single(record: Record) -> Self {
+        let mut records = PacketRecords::new();
+        records.push(record);
+        Self {
+            records: Box::new(Records { records }),
+        }
+    }
+}
+
+fn frame_packet(mut packet: &[u8]) -> Result<ArrayVec<&[u8], MAX_DATAGRAM_RECORDS>, InternalError> {
+    let mut frames = ArrayVec::new();
+    while !packet.is_empty() {
+        let record_end = if Dtls13Record::is_ciphertext_header(packet[0]) {
+            if packet[0] & 0x10 != 0 {
+                break;
+            }
+            if packet.len() < 2 {
+                return Err(InternalError::parse_incomplete());
+            }
+            let flags = packet[0];
+            let s_flag = flags & 0b0000_1000 != 0;
+            let l_flag = flags & 0b0000_0100 != 0;
+            let seq_len = if s_flag { 2 } else { 1 };
+            let len_len = if l_flag { 2 } else { 0 };
+            let header_len = 1 + seq_len + len_len;
+            if packet.len() < header_len {
+                return Err(InternalError::parse_incomplete());
+            }
+            if l_flag {
+                let len_offset = 1 + seq_len;
+                // unwrap: header_len check above ensures 2 bytes at len_offset
+                let length_bytes: [u8; 2] = packet[len_offset..len_offset + 2].try_into().unwrap();
+                let length = u16::from_be_bytes(length_bytes) as usize;
+                header_len + length
+            } else {
+                packet.len()
+            }
+        } else {
+            if packet.len() < Dtls13Record::PLAINTEXT_HEADER_LEN {
+                return Err(InternalError::parse_incomplete());
+            }
+            // unwrap: PLAINTEXT_HEADER_LEN check above ensures 2 bytes at offset
+            let length_bytes: [u8; 2] = packet[Dtls13Record::PLAINTEXT_LENGTH_OFFSET]
+                .try_into()
+                .unwrap();
+            Dtls13Record::PLAINTEXT_HEADER_LEN + u16::from_be_bytes(length_bytes) as usize
+        };
+        if packet.len() < record_end {
+            return Err(InternalError::parse_incomplete());
+        }
+        frames
+            .try_push(&packet[..record_end])
+            .map_err(|_| InternalError::too_many_records())?;
+        packet = &packet[record_end..];
+    }
+    Ok(frames)
 }
 
 /// A number of records parsed from a single UDP packet.
 #[derive(Debug)]
 pub struct Records {
-    pub records: ArrayVec<Record, 16>,
-}
-
-impl Records {
-    pub fn parse(
-        packet: &[u8],
-        decrypt: &mut dyn RecordHandler,
-        cs: Option<Dtls13CipherSuite>,
-    ) -> Result<Records, InternalError> {
-        let mut parsed_records: ArrayVec<Record, 16> = ArrayVec::new();
-        if let Err(error) = Self::parse_records(packet, decrypt, cs, &mut parsed_records) {
-            for record in parsed_records {
-                decrypt.push_buffer(record.into_buffer());
-            }
-            return Err(error);
-        }
-
-        let mut records = ArrayVec::new();
-        for record in parsed_records {
-            if let Some(record) = decrypt.classify_record(record)? {
-                records
-                    .try_push(record)
-                    .expect("filtered records cannot exceed parsed records");
-            }
-        }
-
-        Ok(Records { records })
-    }
-
-    fn parse_records(
-        mut packet: &[u8],
-        decrypt: &mut dyn RecordHandler,
-        cs: Option<Dtls13CipherSuite>,
-        parsed_records: &mut ArrayVec<Record, 16>,
-    ) -> Result<(), InternalError> {
-        // Find record boundaries and copy each record ONCE from the packet
-        while !packet.is_empty() {
-            let record_end = if Dtls13Record::is_ciphertext_header(packet[0]) {
-                // CID bit set means we can't determine record boundaries (unsupported).
-                // Discard the rest of the datagram.
-                if packet[0] & 0x10 != 0 {
-                    break;
-                }
-
-                // Unified header: variable length
-                if packet.len() < 2 {
-                    return Err(InternalError::parse_incomplete());
-                }
-
-                let flags = packet[0];
-                let s_flag = flags & 0b0000_1000 != 0;
-                let l_flag = flags & 0b0000_0100 != 0;
-                let seq_len = if s_flag { 2 } else { 1 };
-                let len_len = if l_flag { 2 } else { 0 };
-                let header_len = 1 + seq_len + len_len;
-
-                if packet.len() < header_len {
-                    return Err(InternalError::parse_incomplete());
-                }
-
-                if l_flag {
-                    let len_offset = 1 + seq_len;
-                    // unwrap: header_len check above ensures 2 bytes at len_offset
-                    let length_bytes: [u8; 2] =
-                        packet[len_offset..len_offset + 2].try_into().unwrap();
-                    let length = u16::from_be_bytes(length_bytes) as usize;
-                    header_len + length
-                } else {
-                    // No length field: record consumes the rest of the datagram
-                    packet.len()
-                }
-            } else {
-                // Plaintext: fixed 13-byte header
-                if packet.len() < Dtls13Record::PLAINTEXT_HEADER_LEN {
-                    return Err(InternalError::parse_incomplete());
-                }
-
-                // unwrap: PLAINTEXT_HEADER_LEN check above ensures 2 bytes at offset
-                let length_bytes: [u8; 2] = packet[Dtls13Record::PLAINTEXT_LENGTH_OFFSET]
-                    .try_into()
-                    .unwrap();
-                let length = u16::from_be_bytes(length_bytes) as usize;
-                Dtls13Record::PLAINTEXT_HEADER_LEN + length
-            };
-
-            if packet.len() < record_end {
-                return Err(InternalError::parse_incomplete());
-            }
-
-            // This is the ONLY copy: packet -> record buffer
-            let record_slice = &packet[..record_end];
-            let record = Record::parse(record_slice, decrypt, cs)?;
-            if let Some(record) = record {
-                if let Err(error) = parsed_records.try_push(record) {
-                    decrypt.push_buffer(error.element().into_buffer());
-                    return Err(InternalError::too_many_records());
-                }
-            } else {
-                trace!("Discarding replayed rec");
-            }
-
-            packet = &packet[record_end..];
-        }
-
-        Ok(())
-    }
+    pub records: PacketRecords,
 }
 
 impl Deref for Records {
@@ -186,22 +187,40 @@ pub struct Record {
 }
 
 impl Record {
-    /// The first parse pass only parses the record header which is unencrypted.
-    /// Copies record data from UDP packet ONCE into a pooled buffer.
-    pub fn parse(
-        record_slice: &[u8],
-        decrypt: &mut dyn RecordHandler,
+    /// Decode an owned pooled buffer, returning it through the handler on discard.
+    pub fn decode_owned(
+        mut buffer: Buf,
+        handler: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
     ) -> Result<Option<Record>, InternalError> {
-        // ONLY COPY: UDP packet slice -> pooled buffer
-        let mut buffer = decrypt.pop_buffer();
-        buffer.extend_from_slice(record_slice);
-
-        match Self::parse_buffer(&mut buffer, decrypt, cs) {
-            Ok(Some(parsed)) => Ok(Some(Record { buffer, parsed })),
-            result => {
-                decrypt.push_buffer(buffer);
-                result.map(|_| None)
+        let Some(&flags) = buffer.first() else {
+            handler.push_buffer(buffer);
+            return Ok(None);
+        };
+        if Dtls13Record::is_ciphertext_header(flags) && !handler.is_peer_encryption_enabled() {
+            handler.push_buffer(buffer);
+            return Ok(None);
+        }
+        match Self::parse_buffer(&mut buffer, handler, cs) {
+            Ok(Some(parsed)) => {
+                if (parsed.record.content_type == ContentType::Handshake
+                    && parsed.handshakes.is_empty())
+                    || (parsed.record.content_type == ContentType::ApplicationData
+                        && parsed.record.sequence.epoch < 3)
+                {
+                    handler.push_buffer(buffer);
+                    Ok(None)
+                } else {
+                    Ok(Some(Record { buffer, parsed }))
+                }
+            }
+            Ok(None) => {
+                handler.push_buffer(buffer);
+                Ok(None)
+            }
+            Err(error) => {
+                handler.push_buffer(buffer);
+                Err(error)
             }
         }
     }
@@ -250,7 +269,7 @@ impl Record {
         let parsed = Box::new(parsed);
 
         // Plaintext records (epoch 0) are not encrypted
-        if !is_ciphertext || !decrypt.is_peer_encryption_enabled() {
+        if !is_ciphertext {
             return Ok(Some(parsed));
         }
 
@@ -430,6 +449,8 @@ pub trait RecordHandler {
     fn pop_buffer(&mut self) -> Buf;
     /// Recycle a buffer when parsing fails or silently discards a record.
     fn push_buffer(&mut self, buffer: Buf);
+    /// Return ownership in `Ok(Some(record))`; recycle it in every other case,
+    /// including `Ok(None)` and `Err`.
     fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error>;
     fn is_peer_encryption_enabled(&self) -> bool;
     fn resolve_epoch(&self, epoch_bits: u8) -> u16;
@@ -567,6 +588,7 @@ mod tests {
         buffers_returned: usize,
         classify_calls: usize,
         dropped_acks: usize,
+        fail_classify_at: Option<usize>,
     }
 
     impl RecordHandler for TestHandler {
@@ -582,6 +604,10 @@ mod tests {
 
         fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error> {
             self.classify_calls += 1;
+            if self.fail_classify_at == Some(self.classify_calls) {
+                self.push_buffer(record.into_buffer());
+                return Err(Error::ReceiveQueueFull);
+            }
             if record.record().content_type == ContentType::Ack {
                 self.dropped_acks += 1;
                 self.push_buffer(record.into_buffer());
@@ -663,18 +689,16 @@ mod tests {
         packet.extend_from_slice(&build_ciphertext_record(2, 2, &[0x11, 0x22, 0x33]));
 
         let mut handler = TestHandler::default();
-        let incoming = Incoming::parse_packet(&packet, &mut handler, None)
-            .unwrap()
-            .expect("ciphertext application data record should remain");
+        let (incoming, pending) = Incoming::parse_packet(&packet, &mut handler, None).unwrap();
 
-        assert_eq!(handler.classify_calls, 2);
+        assert_eq!(handler.classify_calls, 1);
         assert_eq!(handler.dropped_acks, 1);
-        assert_eq!(incoming.records().len(), 1);
+        assert!(incoming.is_none());
+        assert_eq!(pending.len(), 1);
         assert_eq!(
-            incoming.first().record().content_type,
-            ContentType::ApplicationData
+            pending[0].as_ref(),
+            build_ciphertext_record(2, 2, &[0x11, 0x22, 0x33])
         );
-        assert_eq!(incoming.first().record().sequence.epoch, 2);
     }
 
     #[test]
@@ -687,13 +711,13 @@ mod tests {
 
         let packet = build_ciphertext_record(2, 1, &[0x11; 1500]);
         for _ in 0..10_000 {
-            let incoming = Incoming::parse_packet(&packet, &mut handler, None)
-                .expect("parse application data")
-                .expect("packet contains a record");
-            assert_eq!(incoming.first().buffer().as_ptr(), allocation);
-            assert_eq!(incoming.first().buffer(), packet);
-            for record in incoming.into_records() {
-                handler.push_buffer(record.into_buffer());
+            let (incoming, pending) =
+                Incoming::parse_packet(&packet, &mut handler, None).expect("parse packet");
+            assert!(incoming.is_none());
+            assert_eq!(pending[0].as_ptr(), allocation);
+            assert_eq!(pending[0].as_ref(), packet);
+            for buffer in pending {
+                handler.push_buffer(buffer);
             }
         }
     }
@@ -707,9 +731,10 @@ mod tests {
         handler.push_buffer(buffer);
 
         let packet = build_plaintext_record(ContentType::ApplicationData, 1, &[0x11; 1500]);
-        let incoming = Incoming::parse_packet(&packet, &mut handler, None)
+        let (incoming, pending) = Incoming::parse_packet(&packet, &mut handler, None)
             .expect("invalid plaintext application data is discarded");
         assert!(incoming.is_none());
+        assert!(pending.is_empty());
         let reused = handler.pop_buffer();
         assert!(reused.is_empty());
         assert_eq!(reused.as_ptr(), allocation);
@@ -718,15 +743,34 @@ mod tests {
     #[test]
     fn truncated_datagram_recycles_all_pooled_records() {
         let mut handler = TestHandler::default();
-        let mut packet = build_ciphertext_record(2, 1, &[0x11; 1500]);
+        let mut packet = build_plaintext_record(ContentType::Ack, 0, &[0, 0]);
+        packet.extend_from_slice(&build_ciphertext_record(2, 1, &[0x11; 32]));
         packet.push(0xFF);
 
         assert!(Incoming::parse_packet(&packet, &mut handler, None).is_err());
         assert_eq!(handler.classify_calls, 0);
+        assert_eq!(handler.buffers_returned, handler.buffers_acquired);
         assert_eq!(
-            handler.buffers_returned, handler.buffers_acquired,
-            "discarding a malformed datagram must recycle its accepted records"
+            handler.buffers_acquired, 0,
+            "framing precedes buffer checkout"
         );
+    }
+
+    #[test]
+    fn classifier_error_recycles_prefix_suffix_and_pending_once() {
+        let mut handler = TestHandler {
+            fail_classify_at: Some(2),
+            ..TestHandler::default()
+        };
+        let mut packet = build_plaintext_record(ContentType::Alert, 0, &[1]);
+        packet.extend_from_slice(&build_plaintext_record(ContentType::Alert, 1, &[1]));
+        packet.extend_from_slice(&build_plaintext_record(ContentType::Alert, 2, &[1]));
+        packet.extend_from_slice(&build_ciphertext_record(2, 3, &[0x11; 32]));
+
+        assert!(Incoming::parse_packet(&packet, &mut handler, None).is_err());
+        assert_eq!(handler.classify_calls, 2);
+        assert_eq!(handler.buffers_acquired, 4);
+        assert_eq!(handler.buffers_returned, 4);
     }
 
     #[test]
@@ -739,9 +783,49 @@ mod tests {
 
         assert!(Incoming::parse_packet(&packet, &mut handler, None).is_err());
         assert_eq!(handler.classify_calls, 0);
+        assert_eq!(handler.buffers_returned, handler.buffers_acquired);
         assert_eq!(
-            handler.buffers_returned, handler.buffers_acquired,
-            "discarding a datagram with too many records must recycle every record"
+            handler.buffers_acquired, 0,
+            "framing precedes buffer checkout"
         );
+    }
+
+    #[test]
+    fn pre_activation_keeps_only_low_bit_two_candidates() {
+        let mut handler = TestHandler::default();
+        let mut packet = Vec::new();
+        for epoch_bits in [0, 1, 3, 2] {
+            packet.extend_from_slice(&build_ciphertext_record(
+                epoch_bits,
+                epoch_bits as u16,
+                &[7],
+            ));
+        }
+        let (incoming, pending) = Incoming::parse_packet(&packet, &mut handler, None).unwrap();
+        assert!(incoming.is_none());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].as_ref(), build_ciphertext_record(2, 2, &[7]));
+        assert_eq!(handler.classify_calls, 0);
+        for buffer in pending {
+            handler.push_buffer(buffer);
+        }
+        assert_eq!(handler.buffers_returned, handler.buffers_acquired);
+    }
+
+    #[test]
+    fn unsupported_cid_stops_framing_after_valid_prefix() {
+        let mut packet = build_plaintext_record(ContentType::Ack, 1, &[0, 0]);
+        packet.extend_from_slice(&[0b0011_0000, 0xff]);
+        let frames = frame_packet(&packet).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], &packet[..15]);
+    }
+
+    #[test]
+    fn no_length_unified_record_consumes_datagram_tail() {
+        let packet = [0b0010_0000 | 0b0000_0010, 1, 0xaa, 0xbb];
+        let frames = frame_packet(&packet).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], packet);
     }
 }
