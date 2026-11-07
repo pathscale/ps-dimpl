@@ -358,8 +358,27 @@ impl Engine {
                 return Err(error.into());
             }
         }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let minimum_fragment = self
+            .config
+            .dtls13_cipher_suites()
+            .map(|suite| suite.min_protected_fragment_len())
+            .min()
+            .unwrap_or(usize::MAX);
         for buf in pending {
-            if self.pending_epoch2.len() < self.config.max_queue_rx() {
+            // Pending records have already passed complete wire framing.
+            let header_len =
+                1 + if buf[0] & 0x08 != 0 { 2 } else { 1 } + if buf[0] & 0x04 != 0 { 2 } else { 0 };
+            if buf.len().saturating_sub(header_len) < minimum_fragment
+                || self
+                    .pending_epoch2
+                    .iter()
+                    .any(|queued| queued.as_ref() == buf.as_ref())
+            {
+                self.push_buffer(buf);
+            } else if self.pending_epoch2.len() < self.config.max_queue_rx() {
                 self.pending_epoch2.push_back(buf);
             } else {
                 self.push_buffer(buf);
@@ -924,6 +943,8 @@ impl Engine {
     /// retransmissions from advancing the counter before validation can reject them.
     pub fn advance_peer_handshake_seq(&mut self) {
         self.peer_handshake_seq_no += 1;
+        self.retire_stale_queue_entries();
+        self.order_queue_rx();
     }
 
     /// Create a DTLSPlaintext record (epoch 0, unencrypted).
@@ -2801,7 +2822,7 @@ mod tests {
             Output::Timeout(_)
         ));
         assert!(engine.queue_rx.is_empty());
-        assert_eq!(engine.pending_epoch2.len(), 2);
+        assert_eq!(engine.pending_epoch2.len(), 1);
         assert!(
             engine
                 .pending_epoch2
@@ -2842,6 +2863,38 @@ mod tests {
             engine.pop_buffer().into_vec().capacity() >= 2048,
             "discarding a duplicate must preserve its reusable receive allocation"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn pending_budget_rejects_short_records_and_coalesces_only_identical_bytes() {
+        let cert = generate_self_signed_certificate().expect("generate certificate");
+        let config = Arc::new(Config::builder().max_queue_rx(2).build().unwrap());
+        let mut engine = Engine::new(config, cert);
+        let short = [0x26, 0, 0, 1, 0];
+        for _ in 0..40 {
+            engine
+                .parse_packet(&short)
+                .expect("discard impossible ciphertext");
+        }
+        assert!(engine.pending_epoch2.is_empty());
+
+        let mut first = encrypted_application_data_record(1, &[0xAA; 24]);
+        first[0] = (first[0] & !3) | 2;
+        for _ in 0..40 {
+            engine
+                .parse_packet(&first)
+                .expect("coalesce repeated ciphertext");
+        }
+        assert_eq!(engine.pending_epoch2.len(), 1);
+        let mut distinct = first.clone();
+        *distinct.last_mut().unwrap() ^= 1;
+        engine
+            .parse_packet(&distinct)
+            .expect("retain distinct protected bytes");
+        assert_eq!(engine.pending_epoch2.len(), 2);
+        assert_eq!(engine.pending_epoch2[0].as_ref(), first.as_slice());
+        assert_eq!(engine.pending_epoch2[1].as_ref(), distinct.as_slice());
     }
 
     fn parsed_key_update(seq: u16) -> Incoming {
@@ -3153,6 +3206,11 @@ mod tests {
                 .is_some()
         );
         assert_eq!(body.as_ref(), hello.as_slice());
+        engine.advance_peer_handshake_seq();
+        assert!(
+            engine.queue_rx.is_empty(),
+            "stale tail must not block the next message"
+        );
     }
 
     /// Issue 2: Epoch-0 sequence number must have an overflow guard.
