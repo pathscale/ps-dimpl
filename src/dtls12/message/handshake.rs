@@ -82,6 +82,16 @@ impl Handshake {
         let (input, message_seq) = be_u16(input)?;
         let (input, fragment_offset) = be_u24(input)?;
         let (input, fragment_length) = be_u24(input)?;
+        if fragment_offset
+            .checked_add(fragment_length)
+            .map_or(true, |end| end > length)
+            || (length > 0 && fragment_length == 0)
+        {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
 
         Ok((
             input,
@@ -576,6 +586,107 @@ mod tests {
         0x01, // CompressionMethods length
         0x00, // CompressionMethod::Null
     ];
+
+    fn fragment_wire(length: u32, offset: u32, fragment_length: u32, body: &[u8]) -> Vec<u8> {
+        let mut wire = vec![MessageType::ClientHello.as_u8()];
+        wire.extend_from_slice(&length.to_be_bytes()[1..]);
+        wire.extend_from_slice(&0u16.to_be_bytes());
+        wire.extend_from_slice(&offset.to_be_bytes()[1..]);
+        wire.extend_from_slice(&fragment_length.to_be_bytes()[1..]);
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    #[test]
+    fn parse_fragment_header_bounds_from_wire_bytes() {
+        let cases = [
+            (4, 3, 2, &[0xAA, 0xBB][..], false),
+            (4, 0, 0, &[][..], false),
+            (4, 1, 2, &[0xAA, 0xBB][..], true),
+            (4, 2, 2, &[0xAA, 0xBB][..], true),
+        ];
+
+        for (length, offset, fragment_length, body, valid) in cases {
+            let wire = fragment_wire(length, offset, fragment_length, body);
+            let parsed = Handshake::parse(&wire, 7, None, true);
+            if valid {
+                // unwrap: these table entries encode in-bounds fragments with complete bodies.
+                let (rest, handshake) = parsed.unwrap();
+                assert!(rest.is_empty());
+                assert_eq!(wire.len() - rest.len(), 12 + fragment_length as usize);
+                assert_eq!(handshake.header.length, length);
+                assert_eq!(handshake.header.fragment_offset, offset);
+                assert_eq!(handshake.header.fragment_length, fragment_length);
+                assert_eq!(
+                    handshake.body,
+                    Body::Fragment(19..19 + fragment_length as usize)
+                );
+            } else {
+                assert!(matches!(
+                    parsed,
+                    Err(Err::Error(Error {
+                        code: ErrorKind::Verify,
+                        ..
+                    }))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn parse_header_rejects_fragment_bounds_at_u24_limit() {
+        let wire = fragment_wire(0x00FF_FFFF, 0x00FF_FFFE, 2, &[]);
+        assert!(matches!(
+            Handshake::parse_header(&wire),
+            Err(Err::Error(Error {
+                code: ErrorKind::Verify,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn parse_zero_body_server_hello_done_and_reject_nonzero_empty_fragment() {
+        let wire = [
+            MessageType::ServerHelloDone.as_u8(),
+            0,
+            0,
+            0, // total length
+            0,
+            0, // message sequence
+            0,
+            0,
+            0, // fragment offset
+            0,
+            0,
+            0, // fragment length
+        ];
+        // unwrap: the fixture is a complete zero-body ServerHelloDone handshake.
+        let (rest, handshake) = Handshake::parse(&wire, 0, None, false).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(handshake.body, Body::ServerHelloDone);
+
+        let invalid = fragment_wire(0, 1, 0, &[]);
+        assert!(matches!(
+            Handshake::parse(&invalid, 0, None, true),
+            Err(Err::Error(Error {
+                code: ErrorKind::Verify,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn parse_fragment_body_truncation_remains_checked_after_header() {
+        let wire = fragment_wire(4, 2, 2, &[0xAA]);
+        assert!(matches!(
+            Handshake::parse(&wire, 0, None, true),
+            Err(Err::Error(Error {
+                code: ErrorKind::Eof,
+                ..
+            }))
+        ));
+    }
 
     #[test]
     fn message_type_newtype_shape() {
