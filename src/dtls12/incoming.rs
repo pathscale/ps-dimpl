@@ -90,12 +90,9 @@ impl Records {
                 let fragment = header.fragment(record.buffer());
                 header.content_type == ContentType::ChangeCipherSpec
                     && epoch == 0
-                    && fragment == &[1_u8]
+                    && fragment == [1_u8]
             };
-            if !decrypt.is_peer_encryption_enabled()
-                && !seen_ccs
-                && epoch > 0
-            {
+            if !decrypt.is_peer_encryption_enabled() && !seen_ccs && epoch > 0 {
                 // Future-epoch records cannot yet be authenticated. Keep a
                 // record only when this datagram first carries a valid CCS.
                 decrypt.push_buffer(record.into_buffer());
