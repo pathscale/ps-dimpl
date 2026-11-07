@@ -1,14 +1,13 @@
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 
 use super::queue::{QueueRx, QueueTx};
 use crate::buffer::{Buf, BufferPool, TmpBuf};
-use crate::crypto::prf_hkdf;
 use crate::crypto::Aad;
 use crate::crypto::Cipher;
 use crate::crypto::HmacProvider;
@@ -16,6 +15,7 @@ use crate::crypto::Nonce;
 use crate::crypto::SigningKey;
 use crate::crypto::SupportedDtls13CipherSuite;
 use crate::crypto::SupportedKxGroup;
+use crate::crypto::prf_hkdf;
 use crate::dtls13::incoming::{Incoming, Record, RecordHandler};
 use crate::dtls13::message::Body;
 use crate::dtls13::message::ContentType;
@@ -371,149 +371,192 @@ impl Engine {
 
     fn insert_incoming(&mut self, incoming: Incoming) -> Result<(), Error> {
         self.purge_handled_queue_rx();
-        if self.queue_rx.len() >= self.config.max_queue_rx() {
-            warn!(
-                "Receive queue full (max {}): {:?}",
-                self.config.max_queue_rx(),
-                self.queue_rx
-            );
-            self.recycle_incoming(incoming);
-            return Err(Error::ReceiveQueueFull);
-        }
-
-        if incoming.first().first_handshake().is_some() {
-            self.insert_incoming_handshake(incoming)
-        } else {
-            self.insert_incoming_non_handshake(incoming)
-        }
-    }
-
-    fn insert_incoming_handshake(&mut self, incoming: Incoming) -> Result<(), Error> {
-        let first_record = incoming.first();
-        let handshake = first_record
-            .first_handshake()
-            .expect("caller ensures handshake");
-
-        let key_current = (
-            handshake.header.message_seq,
-            handshake.header.fragment_offset,
-        );
-
-        let maybe_dupe_seq = incoming
-            .records()
-            .iter()
-            .filter_map(|r| r.first_handshake())
-            .filter_map(|h| h.dupe_triggers_resend())
-            .next();
-
-        if let Some(dupe_seq) = maybe_dupe_seq {
-            if dupe_seq < self.peer_handshake_seq_no {
-                if let Err(error) = self.flight_resend("dupe triggers resend") {
-                    self.recycle_incoming(incoming);
-                    return Err(error);
+        // Only the peer's role-appropriate Hello is legal in epoch 0. A
+        // future Hello cannot be used until local handshake progression reaches it.
+        for record in incoming.records().iter() {
+            if record.record().sequence.epoch != 0 {
+                continue;
+            }
+            for handshake in record.handshakes() {
+                let expected_type = if self.is_client {
+                    MessageType::ServerHello
+                } else {
+                    MessageType::ClientHello
+                };
+                if handshake.header.msg_type != expected_type
+                    || handshake.header.message_seq > self.peer_handshake_seq_no
+                {
+                    handshake.set_handled();
                 }
             }
         }
 
-        // Drop old duplicates we've already processed
-        if handshake.header.message_seq < self.peer_handshake_seq_no {
-            self.recycle_incoming(incoming);
-            return Ok(());
+        self.insert_admitted_incoming(incoming)
+    }
+
+    fn insert_admitted_incoming(&mut self, incoming: Incoming) -> Result<(), Error> {
+        // Resend from an admitted stale Hello before its fragments are retired.
+        let should_resend = incoming
+            .records()
+            .iter()
+            .flat_map(|record| record.handshakes())
+            .filter(|handshake| !handshake.is_handled())
+            .filter(|handshake| handshake.header.message_seq < self.peer_handshake_seq_no)
+            .any(|handshake| handshake.dupe_triggers_resend().is_some());
+        if should_resend {
+            if let Err(error) = self.flight_resend("dupe triggers resend") {
+                self.recycle_incoming(incoming);
+                return Err(error);
+            }
         }
 
-        // Reject new handshakes after initial handshake is complete,
-        // but allow KeyUpdate (a post-handshake message).
-        if self.release_app_data
-            && handshake.header.message_seq >= self.peer_handshake_seq_no
-            && handshake.header.msg_type != MessageType::KeyUpdate
-        {
+        // Retire stale fragments individually so fresh records in the same UDP
+        // datagram remain available to the other receive paths.
+        for record in incoming.records().iter() {
+            for handshake in record.handshakes() {
+                if !handshake.is_handled()
+                    && handshake.header.message_seq < self.peer_handshake_seq_no
+                {
+                    handshake.set_handled();
+                }
+            }
+        }
+
+        self.retire_stale_queue_entries();
+
+        if self.release_app_data && live_handshakes(&incoming).any(disallowed_post_handshake) {
             self.recycle_incoming(incoming);
             return Err(Error::RenegotiationAttempt);
         }
 
-        let search_result = self.queue_rx.binary_search_by(|item| {
-            let key_other = item
-                .first()
-                .first_handshake()
-                .as_ref()
-                .map(|h| (h.header.message_seq, h.header.fragment_offset))
-                .unwrap_or((u16::MAX, u32::MAX));
-            key_other.cmp(&key_current)
-        });
-
-        match search_result {
-            Err(index) => {
-                // Track received record numbers for ACK generation
-                for record in incoming.records().iter() {
-                    let seq = record.record().sequence;
-                    if seq.epoch >= 2 && record.record().content_type == ContentType::Handshake {
-                        let _ = self
-                            .received_record_numbers
-                            .try_push((seq.epoch as u64, seq.sequence_number));
-                    }
-                }
-                self.queue_rx.insert(index, incoming);
-            }
-            Ok(index) => {
-                // Duplicate message_seq + fragment_offset. Replace if either:
-                // (a) the existing entry was already consumed (handled), so a
-                //     fresh retransmission (e.g., CH2 after HRR) can be processed.
-                // (b) the existing entry looks corrupted: its total `length`
-                //     differs from `fragment_length` while the new entry's match,
-                //     indicating the retransmission corrected a bit-flip.
-                let existing = &self.queue_rx[index];
-                let should_replace = existing.first().is_handled() || {
-                    let existing_corrupt = existing
-                        .first()
-                        .first_handshake()
-                        .map(|h| h.header.length != h.header.fragment_length)
-                        .unwrap_or(false);
-                    let incoming_ok = incoming
-                        .first()
-                        .first_handshake()
-                        .map(|h| h.header.length == h.header.fragment_length)
-                        .unwrap_or(false);
-                    existing_corrupt && incoming_ok
-                };
-                if should_replace {
-                    for record in incoming.records().iter() {
-                        let seq = record.record().sequence;
-                        if seq.epoch >= 2 && record.record().content_type == ContentType::Handshake
-                        {
-                            let _ = self
-                                .received_record_numbers
-                                .try_push((seq.epoch as u64, seq.sequence_number));
-                        }
-                    }
-                    let replaced = std::mem::replace(&mut self.queue_rx[index], incoming);
-                    self.recycle_incoming(replaced);
-                } else {
-                    self.recycle_incoming(incoming);
-                }
+        // Match against every live fragment, including siblings behind a
+        // datagram's queue key. A complete retransmission can repair an
+        // incomplete fragment at the same offset.
+        for handshake in live_handshakes(&incoming) {
+            let duplicate = self.queue_rx.iter().flat_map(live_handshakes).any(|old| {
+                fragment_key(old) == fragment_key(handshake)
+                    && (!is_complete_fragment(handshake) || is_complete_fragment(old))
+            });
+            if duplicate {
+                handshake.set_handled();
             }
         }
 
+        if first_unhandled_handshake(&incoming).is_none() {
+            return self.insert_non_handshake_survivor(incoming);
+        }
+
+        let superseded = |old: &Handshake| {
+            !is_complete_fragment(old)
+                && live_handshakes(&incoming)
+                    .any(|new| fragment_key(new) == fragment_key(old) && is_complete_fragment(new))
+        };
+        let queue_full = self.queue_rx.len() >= self.config.max_queue_rx();
+        let frees_slot = queue_full
+            && self.queue_rx.iter().any(|entry| {
+                entry.records().iter().all(|record| {
+                    record.is_handled()
+                        || (!record.handshakes().is_empty()
+                            && record
+                                .handshakes()
+                                .iter()
+                                .all(|h| h.is_handled() || superseded(h)))
+                })
+            });
+        if queue_full && !frees_slot {
+            self.recycle_incoming(incoming);
+            return Err(Error::ReceiveQueueFull);
+        }
+
+        for old in self.queue_rx.iter().flat_map(live_handshakes) {
+            if superseded(old) {
+                old.set_handled();
+            }
+        }
+        self.purge_handled_queue_rx();
+        self.order_queue_rx();
+        let index = self
+            .queue_rx
+            .binary_search_by_key(&queue_order_key(&incoming), queue_order_key)
+            .unwrap_err();
+        self.track_received_handshake_records(&incoming);
+        self.queue_rx.insert(index, incoming);
         Ok(())
     }
 
-    fn insert_incoming_non_handshake(&mut self, incoming: Incoming) -> Result<(), Error> {
-        let first = incoming.first();
-        let seq_current = first.record().sequence;
-
-        let search_result = self
-            .queue_rx
-            .binary_search_by_key(&seq_current, |item| item.first().record().sequence);
-
-        match search_result {
-            Err(index) => self.queue_rx.insert(index, incoming),
-            Ok(_) => {
-                // Duplicate - silently drop. For encrypted records (epoch >= 2) the replay
-                // window filters most duplicates.
+    fn insert_non_handshake_survivor(&mut self, incoming: Incoming) -> Result<(), Error> {
+        loop {
+            let live_record = incoming
+                .records()
+                .iter()
+                .find(|record| record.handshakes().is_empty() && !record.is_handled());
+            let Some(live_record) = live_record else {
                 self.recycle_incoming(incoming);
+                return Ok(());
+            };
+            let seq = live_record.record().sequence;
+            let duplicate = self.queue_rx.iter().any(|item| {
+                item.records().iter().any(|record| {
+                    record.handshakes().is_empty()
+                        && !record.is_handled()
+                        && record.record().sequence == seq
+                })
+            });
+            if duplicate {
+                for record in incoming.records().iter() {
+                    if record.handshakes().is_empty() && record.record().sequence == seq {
+                        record.set_handled();
+                    }
+                }
+                continue;
+            }
+
+            self.order_queue_rx();
+            let key = queue_order_key(&incoming);
+            let index = self
+                .queue_rx
+                .binary_search_by_key(&key, queue_order_key)
+                .unwrap_err();
+            if self.queue_rx.len() >= self.config.max_queue_rx() {
+                warn!(
+                    "Receive queue full (max {}): {:?}",
+                    self.config.max_queue_rx(),
+                    self.queue_rx
+                );
+                self.recycle_incoming(incoming);
+                return Err(Error::ReceiveQueueFull);
+            }
+            self.queue_rx.insert(index, incoming);
+            return Ok(());
+        }
+    }
+
+    fn track_received_handshake_records(&mut self, incoming: &Incoming) {
+        for record in incoming.records().iter() {
+            let seq = record.record().sequence;
+            if seq.epoch >= 2 && record.record().content_type == ContentType::Handshake {
+                let _ = self
+                    .received_record_numbers
+                    .try_push((seq.epoch as u64, seq.sequence_number));
             }
         }
+    }
 
-        Ok(())
+    fn order_queue_rx(&mut self) {
+        self.queue_rx.make_contiguous().sort_by_key(queue_order_key);
+    }
+
+    fn retire_stale_queue_entries(&mut self) {
+        for incoming in self.queue_rx.iter() {
+            for record in incoming.records().iter() {
+                for handshake in record.handshakes() {
+                    if handshake.header.message_seq < self.peer_handshake_seq_no {
+                        handshake.set_handled();
+                    }
+                }
+            }
+        }
+        self.purge_handled_queue_rx();
     }
 
     fn recycle_incoming(&mut self, incoming: Incoming) {
@@ -612,7 +655,7 @@ impl Engine {
                 r.record().content_type == ContentType::ApplicationData
                     && r.record().sequence.epoch >= 3
             })
-            .skip_while(|r| r.is_handled());
+            .filter(|r| !r.is_handled());
 
         let Some(next) = unhandled.next() else {
             return PollOutput::None(buf);
@@ -647,6 +690,7 @@ impl Engine {
                 index += 1;
             }
         }
+        self.order_queue_rx();
     }
 
     fn poll_packet_tx<'a>(&mut self, buf: &'a mut [u8]) -> PollOutput<'a> {
@@ -775,59 +819,9 @@ impl Engine {
         Ok(())
     }
 
-    pub fn has_complete_handshake(&mut self, wanted: MessageType) -> bool {
-        self.has_complete_handshake_with_seq(wanted, self.peer_handshake_seq_no)
-    }
-
-    fn has_complete_handshake_with_seq(&mut self, wanted: MessageType, expected_seq: u16) -> bool {
-        let mut skip_handled = self
-            .queue_rx
-            .iter()
-            .flat_map(|i| i.records().iter())
-            .skip_while(|r| r.is_handled())
-            .take(MAX_DEFRAGMENT_PACKETS)
-            .flat_map(|r| r.handshakes().iter())
-            .skip_while(|h| h.is_handled())
-            .peekable();
-
-        let maybe_first_handshake = skip_handled.peek();
-
-        let Some(first) = maybe_first_handshake else {
-            return false;
-        };
-
-        if first.header.message_seq != expected_seq {
-            return false;
-        }
-
-        if first.header.msg_type != wanted {
-            return false;
-        }
-
-        let wanted_seq = first.header.message_seq;
-        let wanted_length = first.header.length;
-        let mut last_fragment_end = 0;
-
-        for h in skip_handled {
-            if wanted_seq != h.header.message_seq {
-                continue;
-            }
-
-            // Overlap-tolerant: only reject if there's an actual gap
-            if h.header.fragment_offset > last_fragment_end {
-                return false;
-            }
-            let end = h.header.fragment_offset + h.header.fragment_length;
-            if end > last_fragment_end {
-                last_fragment_end = end;
-            }
-
-            if last_fragment_end == wanted_length {
-                return true;
-            }
-        }
-
-        false
+    pub fn has_complete_handshake(&self, wanted: MessageType) -> bool {
+        let fragments = ordered_fragments(&self.queue_rx);
+        handshake_ready(&fragments, wanted, self.peer_handshake_seq_no)
     }
 
     pub fn next_handshake(
@@ -851,17 +845,23 @@ impl Engine {
         defragment_buffer: &mut Buf,
         allow_unknown_client_hello_suites: bool,
     ) -> Result<Option<Handshake>, InternalError> {
-        if !self.has_complete_handshake(wanted) {
+        let fragments = ordered_fragments(&self.queue_rx);
+        if !handshake_ready(&fragments, wanted, self.peer_handshake_seq_no) {
             return Ok(None);
         }
 
-        let iter = self
-            .queue_rx
-            .iter()
-            .flat_map(|i| i.records().iter())
-            .skip_while(|r| r.is_handled())
-            .flat_map(|r| r.handshakes().iter().map(move |h| (h, r.buffer())))
-            .skip_while(|(h, _)| h.is_handled());
+        let first = fragments[0].0;
+        let iter = fragments
+            .into_iter()
+            .filter(|(h, _)| same_handshake(first, h))
+            .scan(false, |complete, fragment| {
+                if *complete {
+                    return None;
+                }
+                *complete = fragment.0.header.fragment_offset + fragment.0.header.fragment_length
+                    == first.header.length;
+                Some(fragment)
+            });
 
         let handshake = if allow_unknown_client_hello_suites {
             Handshake::defragment_allow_unknown_client_hello_suites(
@@ -889,17 +889,23 @@ impl Engine {
         wanted: MessageType,
         defragment_buffer: &mut Buf,
     ) -> Result<Option<Handshake>, InternalError> {
-        if !self.has_complete_handshake(wanted) {
+        let fragments = ordered_fragments(&self.queue_rx);
+        if !handshake_ready(&fragments, wanted, self.peer_handshake_seq_no) {
             return Ok(None);
         }
 
-        let iter = self
-            .queue_rx
-            .iter()
-            .flat_map(|i| i.records().iter())
-            .skip_while(|r| r.is_handled())
-            .flat_map(|r| r.handshakes().iter().map(move |h| (h, r.buffer())))
-            .skip_while(|(h, _)| h.is_handled());
+        let first = fragments[0].0;
+        let iter = fragments
+            .into_iter()
+            .filter(|(h, _)| same_handshake(first, h))
+            .scan(false, |complete, fragment| {
+                if *complete {
+                    return None;
+                }
+                *complete = fragment.0.header.fragment_offset + fragment.0.header.fragment_length
+                    == first.header.length;
+                Some(fragment)
+            });
 
         let handshake = Handshake::defragment(
             iter,
@@ -1297,12 +1303,22 @@ impl Engine {
     /// the handshake epoch (2), causing records to be routed to stale
     /// handshake keys instead of the correct application keys.
     pub fn release_application_data(&mut self) {
-        self.release_app_data = true;
+        self.release_application_data_retaining_handshake_keys();
         self.hs_recv_keys = None;
     }
 
     pub fn release_application_data_retaining_handshake_keys(&mut self) {
         self.release_app_data = true;
+        self.retire_stale_queue_entries();
+        // A datagram admitted before Finished may also contain a handshake
+        // that is invalid after Finished. Keep any KeyUpdate or app siblings.
+        for handshake in self.queue_rx.iter().flat_map(live_handshakes) {
+            if disallowed_post_handshake(handshake) {
+                handshake.set_handled();
+            }
+        }
+        self.purge_handled_queue_rx();
+        self.order_queue_rx();
     }
 
     /// Whether a close_notify alert has been received from the peer.
@@ -1460,95 +1476,21 @@ impl Engine {
 
     /// Check if the incoming handshake queue needs help (missing fragments/messages).
     fn handshake_ack_help_needed(&self) -> bool {
-        let mut skip_handled = self
-            .queue_rx
-            .iter()
-            .flat_map(|i| i.records().iter())
-            .skip_while(|r| r.is_handled())
-            .take(MAX_DEFRAGMENT_PACKETS)
-            .flat_map(|r| r.handshakes().iter())
-            .skip_while(|h| h.is_handled())
-            .peekable();
-
-        let Some(first) = skip_handled.peek() else {
-            return false;
-        };
-
-        // If we're not seeing the expected message_seq, we're missing earlier fragments.
-        if first.header.message_seq != self.peer_handshake_seq_no {
-            return true;
-        }
-
-        // Check if the current message is complete
-        let wanted_seq = first.header.message_seq;
-        let wanted_length = first.header.length;
-        let mut last_fragment_end = 0;
-
-        for h in skip_handled {
-            if wanted_seq != h.header.message_seq {
-                continue;
-            }
-            // Overlap-tolerant: only flag help needed if there's an actual gap
-            if h.header.fragment_offset > last_fragment_end {
-                return true;
-            }
-            let end = h.header.fragment_offset + h.header.fragment_length;
-            if end > last_fragment_end {
-                last_fragment_end = end;
-            }
-            if last_fragment_end == wanted_length {
-                return false;
-            }
-        }
-
-        true
+        let fragments = ordered_fragments(&self.queue_rx);
+        fragments.first().is_some_and(|(first, _)| {
+            first.header.message_seq != self.peer_handshake_seq_no
+                || !fragment_coverage(&fragments).0
+        })
     }
 
     /// Check if there's a gap in the incoming handshake data that requires
     /// an immediate ACK to help the peer retransmit.
     fn has_gap_in_incoming_handshake(&self) -> bool {
-        let mut skip_handled = self
-            .queue_rx
-            .iter()
-            .flat_map(|i| i.records().iter())
-            .skip_while(|r| r.is_handled())
-            .take(MAX_DEFRAGMENT_PACKETS)
-            .flat_map(|r| r.handshakes().iter())
-            .skip_while(|h| h.is_handled())
-            .peekable();
-
-        let Some(first) = skip_handled.peek() else {
-            return false;
-        };
-
-        // Gap: not seeing the expected message_seq
-        if first.header.message_seq != self.peer_handshake_seq_no {
-            return true;
-        }
-
-        // Check for fragment gaps within the expected message
-        let wanted_seq = first.header.message_seq;
-        let wanted_length = first.header.length;
-        let mut last_fragment_end = 0;
-
-        for h in skip_handled {
-            if wanted_seq != h.header.message_seq {
-                continue;
-            }
-            // Overlap-tolerant: only flag a gap if there's an actual gap
-            if h.header.fragment_offset > last_fragment_end {
-                return true;
-            }
-            let end = h.header.fragment_offset + h.header.fragment_length;
-            if end > last_fragment_end {
-                last_fragment_end = end;
-            }
-            if last_fragment_end == wanted_length {
-                return false;
-            }
-        }
-
-        false
+        let fragments = ordered_fragments(&self.queue_rx);
+        fragments.first().is_some_and(|(first, _)| {
+            first.header.message_seq != self.peer_handshake_seq_no
+                || fragment_coverage(&fragments).1
+        })
     }
 
     /// Schedule a handshake ACK if we detect gaps or partial flights.
@@ -1980,7 +1922,7 @@ impl Engine {
             fragment.extend_from_slice(&msg_seq.to_be_bytes()); // message_seq
             fragment.extend_from_slice(&0u32.to_be_bytes()[1..]); // fragment_offset = 0
             fragment.extend_from_slice(&1u32.to_be_bytes()[1..]); // fragment_length = 1
-                                                                  // Body: 1 byte
+            // Body: 1 byte
             fragment.push(request.as_u8());
         })?;
 
@@ -2002,9 +1944,9 @@ impl Engine {
         // are reset. Only reset epoch 2 record sequence (unused at HRR time).
         self.hs_send_seq = 0;
         self.handshake_ack_deadline = None;
-        // Drain handled items so stale retransmissions with the same
-        // message_seq can be accepted after the sequence number reset.
-        self.queue_rx.retain(|item| !item.first().is_handled());
+        // Remove only fully handled entries, preserving live siblings in
+        // mixed datagrams, then restore the unified receive-queue order.
+        self.purge_handled_queue_rx();
     }
 
     /// Derive epoch keys (cipher + IV + sn_key) from a traffic secret.
@@ -2181,6 +2123,16 @@ impl Engine {
     pub fn enable_peer_encryption(&mut self) -> Result<(), InternalError> {
         debug!("Peer encryption enabled");
         self.peer_encryption_enabled = true;
+        for incoming in self.queue_rx.iter() {
+            for record in incoming.records().iter() {
+                if record.record().sequence.epoch == 0 {
+                    for handshake in record.handshakes() {
+                        handshake.set_handled();
+                    }
+                }
+            }
+        }
+        self.purge_handled_queue_rx();
         let cs = self.cipher_suite;
         while let Some(buf) = self.pending_epoch2.pop_front() {
             let result = (|| -> Result<(), InternalError> {
@@ -2314,6 +2266,105 @@ fn jittered_aead_threshold(limit: u64, rng: &mut SeededRng) -> u64 {
     }
     let offset: u64 = rng.random::<u64>() % (quarter + 1);
     limit - quarter + offset
+}
+
+fn live_handshakes(incoming: &Incoming) -> impl Iterator<Item = &Handshake> {
+    incoming
+        .records()
+        .iter()
+        .flat_map(|record| record.handshakes())
+        .filter(|handshake| !handshake.is_handled())
+}
+
+fn fragment_key(handshake: &Handshake) -> (u16, u32) {
+    (
+        handshake.header.message_seq,
+        handshake.header.fragment_offset,
+    )
+}
+
+fn first_unhandled_handshake(incoming: &Incoming) -> Option<&Handshake> {
+    live_handshakes(incoming).min_by_key(|handshake| fragment_key(handshake))
+}
+
+fn is_complete_fragment(handshake: &Handshake) -> bool {
+    handshake.header.length == handshake.header.fragment_length
+}
+
+fn disallowed_post_handshake(handshake: &Handshake) -> bool {
+    handshake.header.msg_type != MessageType::KeyUpdate
+}
+
+fn same_handshake(first: &Handshake, other: &Handshake) -> bool {
+    first.header.message_seq == other.header.message_seq
+        && first.header.msg_type == other.header.msg_type
+        && first.header.length == other.header.length
+}
+
+fn ordered_fragments(queue: &QueueRx) -> Vec<(&Handshake, &[u8])> {
+    // The receive scan is bounded by the record limit and the parser's
+    // per-record fragment limit. Keep references into the original buffers.
+    let mut fragments: Vec<_> = queue
+        .iter()
+        .flat_map(|incoming| incoming.records().iter())
+        .filter(|record| !record.is_handled() && !record.handshakes().is_empty())
+        .take(MAX_DEFRAGMENT_PACKETS)
+        .flat_map(|record| {
+            record
+                .handshakes()
+                .iter()
+                .filter(|h| !h.is_handled())
+                .map(move |h| (h, record.buffer()))
+        })
+        .collect();
+    fragments.sort_by_key(|(h, _)| fragment_key(h));
+    fragments
+}
+
+fn handshake_ready(fragments: &[(&Handshake, &[u8])], wanted: MessageType, seq: u16) -> bool {
+    fragments.first().is_some_and(|(first, _)| {
+        first.header.message_seq == seq
+            && first.header.msg_type == wanted
+            && fragment_coverage(fragments).0
+    })
+}
+
+/// Return whether the first message is complete and whether it has an explicit gap.
+fn fragment_coverage(fragments: &[(&Handshake, &[u8])]) -> (bool, bool) {
+    let first = fragments[0].0;
+    let mut covered = 0;
+    for (h, _) in fragments.iter().filter(|(h, _)| same_handshake(first, h)) {
+        if h.header.fragment_offset > covered {
+            return (false, true);
+        }
+        covered = covered.max(h.header.fragment_offset + h.header.fragment_length);
+        if covered == first.header.length {
+            return (true, false);
+        }
+    }
+    (false, false)
+}
+
+/// Shared receive-queue order: live handshakes first by handshake key, then
+/// non-handshake survivors by their first live record sequence.
+fn queue_order_key(incoming: &Incoming) -> (u8, u64, u64) {
+    if let Some(handshake) = first_unhandled_handshake(incoming) {
+        return (
+            0,
+            handshake.header.message_seq as u64,
+            handshake.header.fragment_offset as u64,
+        );
+    }
+
+    incoming
+        .records()
+        .iter()
+        .find(|record| !record.is_handled())
+        .map(|record| {
+            let sequence = record.record().sequence;
+            (1, sequence.epoch as u64, sequence.sequence_number)
+        })
+        .unwrap_or((2, 0, 0))
 }
 
 /// Determine the epoch for a handshake message type.
@@ -2703,6 +2754,30 @@ mod tests {
         packet
     }
 
+    #[cfg(feature = "rust-crypto")]
+    fn plaintext_handshake_record(
+        msg_type: MessageType,
+        message_seq: u16,
+        total_len: u32,
+        fragment_offset: u32,
+        fragment: &[u8],
+    ) -> Vec<u8> {
+        let mut handshake = Vec::new();
+        handshake.push(msg_type.as_u8());
+        handshake.extend_from_slice(&total_len.to_be_bytes()[1..]);
+        handshake.extend_from_slice(&message_seq.to_be_bytes());
+        handshake.extend_from_slice(&fragment_offset.to_be_bytes()[1..]);
+        handshake.extend_from_slice(&(fragment.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(fragment);
+
+        let mut packet = vec![ContentType::Handshake.as_u8(), 0xFE, 0xFD];
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0u64.to_be_bytes()[2..]);
+        packet.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&handshake);
+        packet
+    }
+
     #[test]
     #[cfg(feature = "rust-crypto")]
     fn pre_activation_ciphertext_stays_out_of_the_normal_queue() {
@@ -2740,13 +2815,9 @@ mod tests {
     #[cfg(feature = "rust-crypto")]
     fn duplicate_plaintext_handshake_recycles_its_pooled_buffer() {
         let mut engine = test_engine();
-        let key_update = encrypted_key_update_record(0);
-        let handshake = &key_update[5..key_update.len() - 1];
-        let mut packet = vec![ContentType::Handshake.as_u8(), 0xFE, 0xFD];
-        packet.extend_from_slice(&0u16.to_be_bytes());
-        packet.extend_from_slice(&0u64.to_be_bytes()[2..]);
-        packet.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        packet.extend_from_slice(handshake);
+        let hello = client_hello_body();
+        let packet =
+            plaintext_handshake_record(MessageType::ClientHello, 0, hello.len() as u32, 0, &hello);
 
         engine.parse_packet(&packet).expect("queue first handshake");
         let mut output = [0u8; 2048];
@@ -2795,6 +2866,293 @@ mod tests {
         .expect("parse coalesced packet");
         assert!(pending.is_empty());
         incoming.expect("packet contains records")
+    }
+
+    #[cfg(feature = "rust-crypto")]
+    fn parsed_app_data(seq: u16) -> Incoming {
+        let (incoming, pending) = Incoming::parse_packet(
+            &encrypted_application_data_record(seq, b"app-data"),
+            &mut PassthroughRecordHandler::default(),
+            Some(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
+        )
+        .expect("parse application data packet");
+        assert!(pending.is_empty());
+        incoming.expect("packet contains application data")
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn stale_handshake_keeps_fresh_application_sibling() {
+        let mut engine = test_engine();
+        engine.peer_handshake_seq_no = 1;
+        let incoming = parsed_key_update_with_app_data(0, 2);
+
+        engine
+            .insert_incoming(incoming)
+            .expect("retain live sibling");
+
+        assert_eq!(engine.queue_rx.len(), 1);
+        assert!(engine.queue_rx[0].records()[0].is_handled());
+        assert!(!engine.queue_rx[0].records()[1].is_handled());
+        assert_eq!(
+            engine.queue_rx[0].records()[1].record().content_type,
+            ContentType::ApplicationData
+        );
+        assert_eq!(queue_order_key(&engine.queue_rx[0]).0, 1);
+    }
+
+    #[cfg(feature = "rust-crypto")]
+    fn client_hello_body() -> Vec<u8> {
+        let mut hello = vec![0xFE, 0xFD];
+        hello.extend_from_slice(&[0x5A; 32]); // Random.
+        hello.extend_from_slice(&[
+            0, 0, // Empty session ID and legacy cookie.
+            0, 2, 0x13, 0x03, // TLS_CHACHA20_POLY1305_SHA256.
+            1, 0, // Null compression.
+            0, 7, 0, 43, 0, 3, 2, 0xFE, 0xFC, // Supported versions: DTLS 1.3.
+        ]);
+        hello
+    }
+
+    #[cfg(feature = "rust-crypto")]
+    fn hello_fragment(hello: &[u8], seq: u16, offset: usize, len: usize) -> Vec<u8> {
+        plaintext_handshake_record(
+            MessageType::ClientHello,
+            seq,
+            hello.len() as u32,
+            offset as u32,
+            &hello[offset..offset + len],
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn interleaved_hello_fragments_are_reassembled_in_offset_order() {
+        let mut engine = test_engine();
+        let hello = client_hello_body();
+        let mut packet = hello_fragment(&hello, 0, 0, 4);
+        packet.extend_from_slice(&plaintext_handshake_record(
+            MessageType::KeyUpdate,
+            0,
+            1,
+            0,
+            &[0],
+        ));
+        packet.extend_from_slice(&protected_handshake(MessageType::Finished, 1));
+        packet.extend_from_slice(&hello_fragment(&hello, 0, 8, 4));
+        engine
+            .insert_incoming(parse_with_passthrough(&packet))
+            .expect("admit Hello pieces and future protected handshake");
+        assert!(engine.queue_rx[0].records()[1].is_handled());
+        assert!(engine.has_gap_in_incoming_handshake());
+
+        engine
+            .parse_packet(&hello_fragment(&hello, 0, 4, 4))
+            .unwrap();
+        engine
+            .parse_packet(&hello_fragment(&hello, 0, 12, hello.len() - 12))
+            .unwrap();
+
+        assert!(engine.has_complete_handshake(MessageType::ClientHello));
+        assert!(!engine.has_gap_in_incoming_handshake());
+        assert!(!engine.handshake_ack_help_needed());
+        let mut body = Buf::new();
+        let handshake = engine
+            .next_handshake(MessageType::ClientHello, &mut body)
+            .expect("reassemble ClientHello")
+            .expect("complete ClientHello");
+        assert!(matches!(handshake.body, Body::ClientHello(_)));
+        assert_eq!(body.as_ref(), hello.as_slice());
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn duplicate_handshake_keeps_incoming_live_sibling() {
+        let mut engine = test_engine();
+        engine
+            .insert_incoming(parsed_key_update(0))
+            .expect("queue existing fragment");
+        engine
+            .insert_incoming(parsed_key_update_with_app_data(0, 7))
+            .expect("keep app data sibling");
+
+        assert_eq!(engine.queue_rx.len(), 2);
+        let records = engine.queue_rx[1].records();
+        assert!(records[0].is_handled());
+        assert!(!records[1].is_handled());
+        assert_eq!(
+            records[1].record().content_type,
+            ContentType::ApplicationData
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn queue_is_reordered_after_handshake_becomes_stale() {
+        let mut engine = test_engine();
+        engine
+            .insert_incoming(parsed_key_update_with_app_data(0, 7))
+            .expect("queue mixed handshake and application data");
+        engine
+            .insert_incoming(parsed_app_data(3))
+            .expect("queue application data");
+        engine.advance_peer_handshake_seq();
+
+        let hello = client_hello_body();
+        engine
+            .parse_packet(&hello_fragment(&hello, 1, 0, hello.len()))
+            .unwrap();
+        assert_eq!(queue_order_key(&engine.queue_rx[0]), (0, 1, 0));
+        assert_eq!(queue_order_key(&engine.queue_rx[1]), (1, 3, 3));
+        assert_eq!(queue_order_key(&engine.queue_rx[2]), (1, 3, 7));
+        assert!(engine.has_complete_handshake(MessageType::ClientHello));
+    }
+
+    #[cfg(feature = "rust-crypto")]
+    fn protected_handshake(msg_type: MessageType, message_seq: u16) -> Vec<u8> {
+        let mut packet = encrypted_key_update_record(message_seq);
+        packet[5] = msg_type.as_u8();
+        packet[9..11].copy_from_slice(&message_seq.to_be_bytes());
+        packet
+    }
+
+    #[cfg(feature = "rust-crypto")]
+    fn parse_with_passthrough(packet: &[u8]) -> Incoming {
+        let (incoming, pending) = Incoming::parse_packet(
+            packet,
+            &mut PassthroughRecordHandler::default(),
+            Some(Dtls13CipherSuite::CHACHA20_POLY1305_SHA256),
+        )
+        .expect("parse test datagram");
+        assert!(pending.is_empty());
+        incoming.expect("test datagram contains records")
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn post_handshake_rejects_datagrams_with_any_live_non_key_update() {
+        let mut engine = test_engine();
+        engine.release_application_data();
+        let finished = protected_handshake(MessageType::Finished, 1);
+        assert!(matches!(
+            engine.insert_incoming(parse_with_passthrough(&finished)),
+            Err(Error::RenegotiationAttempt)
+        ));
+
+        let mut mixed = protected_handshake(MessageType::KeyUpdate, 0);
+        mixed.extend_from_slice(&finished);
+        mixed.extend_from_slice(&encrypted_application_data_record(2, b"app-data"));
+        assert!(matches!(
+            engine.insert_incoming(parse_with_passthrough(&mixed)),
+            Err(Error::RenegotiationAttempt)
+        ));
+        assert!(engine.queue_rx.is_empty());
+
+        engine
+            .insert_incoming(parsed_key_update(0))
+            .expect("admit KeyUpdate");
+        let mut body = Buf::new();
+        let update = engine
+            .next_handshake_no_transcript(MessageType::KeyUpdate, &mut body)
+            .expect("reassemble KeyUpdate")
+            .expect("complete KeyUpdate");
+        assert!(matches!(update.body, Body::KeyUpdate(_)));
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn releasing_application_data_retires_already_queued_non_key_update() {
+        let mut engine = test_engine();
+        let mut packet = protected_handshake(MessageType::Finished, 1);
+        packet.extend_from_slice(&protected_handshake(MessageType::KeyUpdate, 1));
+        packet.extend_from_slice(&encrypted_application_data_record(2, b"app-data"));
+        engine
+            .insert_incoming(parse_with_passthrough(&packet))
+            .unwrap();
+        engine.advance_peer_handshake_seq();
+        engine.release_application_data_retaining_handshake_keys();
+
+        assert!(engine.queue_rx[0].records()[0].is_handled());
+        assert!(!engine.queue_rx[0].records()[1].is_handled());
+        assert!(!engine.queue_rx[0].records()[2].is_handled());
+        assert!(engine.has_complete_handshake(MessageType::KeyUpdate));
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn complete_retransmission_preserves_live_siblings_and_respects_capacity() {
+        let hello = client_hello_body();
+        for limit in [1, 2] {
+            let cert = generate_self_signed_certificate().expect("gen cert");
+            let config = Arc::new(Config::builder().max_queue_rx(limit).build().unwrap());
+            let mut engine = Engine::new(config, cert);
+            let mut partial = hello_fragment(&hello, 0, 0, 4);
+            partial.extend_from_slice(&hello_fragment(&hello, 0, 8, 4));
+            engine.parse_packet(&partial).unwrap();
+            assert!(!engine.has_complete_handshake(MessageType::ClientHello));
+
+            let mut complete = hello_fragment(&hello, 0, 0, hello.len());
+            complete.extend_from_slice(&encrypted_application_data_record(1, b"app-data"));
+            let result = engine.insert_incoming(parse_with_passthrough(&complete));
+            if limit == 1 {
+                assert!(matches!(result, Err(Error::ReceiveQueueFull)));
+                assert!(!engine.queue_rx[0].records()[0].is_handled());
+                assert!(!engine.has_complete_handshake(MessageType::ClientHello));
+                continue;
+            }
+
+            result.expect("queue complete retransmission");
+            assert_eq!(engine.queue_rx.len(), 2);
+            assert!(!engine.queue_rx[0].records()[1].is_handled());
+            assert!(engine.queue_rx[1].records()[0].is_handled());
+            assert!(!engine.queue_rx[1].records()[1].is_handled());
+            let mut body = Buf::new();
+            assert!(
+                engine
+                    .next_handshake(MessageType::ClientHello, &mut body)
+                    .expect("reassemble retransmission")
+                    .is_some()
+            );
+            assert_eq!(body.as_ref(), hello.as_slice());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "rust-crypto")]
+    fn complete_retransmission_ignores_redundant_fragment_tail() {
+        let mut hello = client_hello_body();
+        hello[43] = 15; // Extend the extension vector with an unknown extension.
+        hello.extend_from_slice(&[0x12, 0x34, 0, 4, 0, 0, 0, 0]);
+        let mut engine = test_engine();
+        let offsets: Vec<_> = std::iter::once(0).chain(2..=52).collect();
+        let mut partial = Vec::new();
+        for group in offsets.chunks(8) {
+            let mut payload = Vec::new();
+            for &offset in group {
+                payload.extend_from_slice(&hello_fragment(&hello, 0, offset, 1)[13..]);
+            }
+            let mut record = hello_fragment(&hello, 0, group[0], 1);
+            record.truncate(13);
+            record[11..13].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+            record.extend_from_slice(&payload);
+            partial.extend_from_slice(&record);
+        }
+        engine
+            .parse_packet(&partial)
+            .expect("queue fragmented hello");
+        assert!(!engine.has_complete_handshake(MessageType::ClientHello));
+        engine
+            .parse_packet(&hello_fragment(&hello, 0, 0, hello.len()))
+            .expect("queue complete retransmission");
+        assert!(engine.has_complete_handshake(MessageType::ClientHello));
+        let mut body = Buf::new();
+        assert!(
+            engine
+                .next_handshake(MessageType::ClientHello, &mut body)
+                .expect("ignore redundant tail after complete message")
+                .is_some()
+        );
+        assert_eq!(body.as_ref(), hello.as_slice());
     }
 
     /// Issue 2: Epoch-0 sequence number must have an overflow guard.
@@ -2907,7 +3265,8 @@ mod tests {
             .expect("insert initial key update");
         engine.queue_rx[0]
             .first()
-            .first_handshake()
+            .handshakes()
+            .first()
             .expect("initial key update handshake")
             .set_handled();
 

@@ -1672,18 +1672,66 @@ mod tests {
 
     #[test]
     fn empty_server_certificate_is_certificate_error() {
-        let mut client = client();
+        let config = Arc::new(Config::default());
+        let mut client_engine = Engine::new(
+            config.clone(),
+            generate_self_signed_certificate().expect("generate client cert"),
+        );
+        let mut server_engine = Engine::new(
+            config,
+            generate_self_signed_certificate().expect("generate server cert"),
+        );
+        let cipher_suite = Dtls13CipherSuite::CHACHA20_POLY1305_SHA256;
+        client_engine.set_client(true);
+        client_engine.set_cipher_suite(cipher_suite);
+        server_engine.set_cipher_suite(cipher_suite);
+
+        // Derive matching epoch-2 keys for the two endpoint roles. The empty
+        // transcript represents the shared setup point for this focused test.
+        let shared_secret = [0x42; 32];
+        let (client_traffic_secret, server_traffic_secret, _) = client_engine
+            .derive_handshake_secrets(&shared_secret)
+            .expect("derive client handshake secrets");
+        client_engine
+            .install_handshake_keys(&client_traffic_secret, &server_traffic_secret)
+            .expect("install client handshake keys");
+        server_engine
+            .install_handshake_keys(&client_traffic_secret, &server_traffic_secret)
+            .expect("install server handshake keys");
+
+        let mut client = Client::new_with_engine(client_engine, Instant::now());
+        client
+            .engine
+            .enable_peer_encryption()
+            .expect("enable peer encryption");
         client.engine.advance_peer_handshake_seq(); // ServerHello
         client.engine.advance_peer_handshake_seq(); // EncryptedExtensions
 
+        // A DTLS Handshake header for Certificate (message_seq=2), followed
+        // by an empty certificate_list. Encrypt as a real epoch-2 record.
+        server_engine
+            .create_ciphertext_record(ContentType::Handshake, 2, false, |fragment| {
+                fragment.push(MessageType::Certificate.as_u8());
+                fragment.extend_from_slice(&4u32.to_be_bytes()[1..]);
+                fragment.extend_from_slice(&2u16.to_be_bytes());
+                fragment.extend_from_slice(&0u32.to_be_bytes()[1..]);
+                fragment.extend_from_slice(&4u32.to_be_bytes()[1..]);
+                fragment.extend_from_slice(&[0, 0, 0, 0]);
+            })
+            .expect("encrypt epoch-2 empty Certificate");
+        let mut wire = vec![0; 1500];
+        let packet = match server_engine.poll_output(&mut wire, Instant::now()) {
+            crate::Output::Packet(packet) => packet.to_vec(),
+            _ => panic!("expected encrypted Certificate packet"),
+        };
+        assert!(matches!(
+            server_engine.poll_output(&mut wire, Instant::now()),
+            crate::Output::Timeout(_)
+        ));
         client
             .engine
-            .parse_packet(&epoch0_handshake_packet(
-                MessageType::Certificate,
-                2,
-                &[0, 0, 0, 0],
-            ))
-            .expect("queue empty Certificate");
+            .parse_packet(&packet)
+            .expect("decrypt and queue empty Certificate");
 
         let err = State::AwaitCertificate
             .await_certificate(&mut client)

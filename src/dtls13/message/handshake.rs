@@ -76,7 +76,7 @@ impl Handshake {
         let (input, fragment_length) = be_u24(input)?;
         if fragment_offset
             .checked_add(fragment_length)
-            .map_or(true, |end| end > length)
+            .is_none_or(|end| end > length)
             || (length > 0 && fragment_length == 0)
         {
             return Err(nom::Err::Error(nom::error::Error::new(

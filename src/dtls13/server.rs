@@ -184,6 +184,7 @@ impl Server {
     }
 
     pub fn new_with_engine(mut engine: Engine, now: Instant, auto_mode: bool) -> Server {
+        engine.set_client(false);
         let cookie_secret = engine.random_arr();
         let extension_data = engine.pop_buffer();
         let defragment_buffer = engine.pop_buffer();
@@ -974,7 +975,8 @@ impl State {
             if server.engine.config().require_client_certificate() {
                 return Err(Error::CertificateError(
                     crate::CertificateError::NoClientCertificateForVerification,
-                ).into());
+                )
+                .into());
             }
             debug!("Client sent empty certificate list");
             drop(maybe);
@@ -1491,6 +1493,46 @@ fn handshake_create_certificate_request(body: &mut Buf) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rust-crypto")]
+    #[test]
+    fn new_with_engine_resets_role_to_server() {
+        let certificate = crate::certificate::generate_self_signed_certificate()
+            .expect("generate server certificate");
+        let config = Arc::new(Config::builder().build().expect("build config"));
+        let mut engine = Engine::new(config, certificate);
+        engine.set_client(true);
+
+        let mut server = Server::new_with_engine(engine, Instant::now(), false);
+
+        let mut packet = vec![ContentType::Handshake.as_u8(), 0xFE, 0xFD];
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0u64.to_be_bytes()[2..]);
+        packet.extend_from_slice(&12u16.to_be_bytes());
+        packet.extend_from_slice(&[
+            MessageType::ClientHello.as_u8(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        server
+            .engine
+            .parse_packet(&packet)
+            .expect("admit server-side ClientHello");
+        assert!(
+            server
+                .engine
+                .has_complete_handshake(MessageType::ClientHello)
+        );
+    }
 
     #[test]
     fn certificate_request_omits_empty_certificate_authorities() {

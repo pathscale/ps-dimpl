@@ -363,10 +363,6 @@ impl Record {
         &self.parsed.handshakes
     }
 
-    pub fn first_handshake(&self) -> Option<&Handshake> {
-        self.parsed.handshakes.first()
-    }
-
     pub fn is_handled(&self) -> bool {
         if self.parsed.handshakes.is_empty() {
             self.parsed.handled.load(Ordering::Relaxed)
@@ -795,11 +791,7 @@ mod tests {
         let mut handler = TestHandler::default();
         let mut packet = Vec::new();
         for epoch_bits in [0, 1, 3, 2] {
-            packet.extend_from_slice(&build_ciphertext_record(
-                epoch_bits,
-                epoch_bits as u16,
-                &[7],
-            ));
+            packet.extend_from_slice(&build_ciphertext_record(epoch_bits, epoch_bits, &[7]));
         }
         let (incoming, pending) = Incoming::parse_packet(&packet, &mut handler, None).unwrap();
         assert!(incoming.is_none());
