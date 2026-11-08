@@ -2,7 +2,7 @@
 name = "ps-dimpl"
 authors = ["Martin Algesten <martin@algesten.se>"]
 description = "DTLS 1.2/1.3 (Sans-IO, Sync), fork of algesten/dimpl: pure Rust, ChaCha20-Poly1305 only"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pathscale/ps-dimpl"
@@ -35,6 +35,7 @@ once_cell = "1.21.3"
 rand = "0.9"
 arrayvec = "0.7.6"
 subtle = "2.6"
+zeroize = "1"
 
 der = "0.7"
 pkcs8 = { version = "0.10", features = ["pem"] }

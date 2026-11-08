@@ -1,13 +1,24 @@
 //! SRTP keying material types and profiles used by DTLS-SRTP.
+use std::mem;
 use std::ops::Deref;
 
+use zeroize::Zeroizing;
+
+use crate::buffer::Buf;
+
 /// Keying material used as master key for SRTP.
-pub struct KeyingMaterial(Vec<u8>);
+/// The wrapper zeroizes its owned allocation on drop. Callers own any copies
+/// made from the borrowed bytes or passed to [`Self::new`].
+pub struct KeyingMaterial(Zeroizing<Vec<u8>>);
 
 impl KeyingMaterial {
     /// Create a new wrapper for DTLS-SRTP keying material bytes.
     pub fn new(m: &[u8]) -> Self {
-        KeyingMaterial(m.to_vec())
+        Self(Zeroizing::new(m.to_vec()))
+    }
+
+    pub(crate) fn from_export(mut material: Zeroizing<Buf>) -> Self {
+        Self(Zeroizing::new(mem::take(&mut *material).into_vec()))
     }
 }
 
