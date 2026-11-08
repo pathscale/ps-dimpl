@@ -82,11 +82,11 @@ pub struct Client {
     queued_data: Vec<Buf>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum LocalEvent {
     PeerCert,
     Connected,
-    KeyingMaterial(ArrayVec<u8, 88>, SrtpProfile),
+    KeyingMaterial(KeyingMaterial, SrtpProfile),
 }
 
 impl Client {
@@ -1160,33 +1160,15 @@ impl State {
 
         // Extract and emit SRTP keying material if we have a negotiated profile
         if let Some(profile) = client.negotiated_srtp_profile {
-            let suite_hash = client.engine.cipher_suite().unwrap().hash_algorithm();
-
-            let mut out = client.engine.pop_buffer();
-            let mut scratch = client.engine.pop_buffer();
-            if let Ok(keying_material) = client
-                .engine
-                .crypto_context()
-                .extract_srtp_keying_material(profile, suite_hash, &mut out, &mut scratch)
-            {
-                client.engine.push_buffer(out);
-                client.engine.push_buffer(scratch);
-                // Emit the keying material event with the negotiated profile
+            if let Ok(keying_material) = client.engine.extract_srtp_keying_material(profile) {
                 debug!(
                     "SRTP keying material extracted ({} bytes) for profile: {:?}",
                     keying_material.len(),
                     profile
                 );
-                // expect should be correct here since we negotiated the profile
-                let profile = client
-                    .negotiated_srtp_profile
-                    .expect("SRTP profile should be negotiated");
                 client
                     .local_events
                     .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-            } else {
-                client.engine.push_buffer(out);
-                client.engine.push_buffer(scratch);
             }
         }
 
@@ -1399,9 +1381,7 @@ impl LocalEvent {
                 Output::PeerCert(&buf[..l])
             }
             LocalEvent::Connected => Output::Connected,
-            LocalEvent::KeyingMaterial(m, profile) => {
-                Output::KeyingMaterial(KeyingMaterial::new(&m), profile)
-            }
+            LocalEvent::KeyingMaterial(m, profile) => Output::KeyingMaterial(m, profile),
         }
     }
 }

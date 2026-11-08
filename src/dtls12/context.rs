@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
+use zeroize::Zeroizing;
 
-use crate::CryptoError;
+use crate::{CryptoError, KeyingMaterial};
 use crate::buffer::{Buf, TmpBuf, ToBuf};
 use crate::crypto;
 use crate::crypto::SrtpProfile;
@@ -476,9 +477,8 @@ impl CryptoContext {
         &self,
         profile: SrtpProfile,
         hash: HashAlgorithm,
-        out: &mut Buf,
         scratch: &mut Buf,
-    ) -> Result<ArrayVec<u8, 88>, CryptoError> {
+    ) -> Result<KeyingMaterial, CryptoError> {
         const DTLS_SRTP_KEY_LABEL: &str = "EXTRACTOR-dtls_srtp";
 
         let master_secret = match &self.master_secret {
@@ -504,22 +504,18 @@ impl CryptoContext {
         seed.try_extend_from_slice(server_random)
             .expect("server_random too long");
 
+        let mut out = Zeroizing::new(Buf::new());
         crypto::prf_hkdf::prf_tls12(
             self.provider().hmac_provider,
             master_secret,
             DTLS_SRTP_KEY_LABEL,
             &seed,
-            out,
+            &mut out,
             profile.keying_material_len(),
             scratch,
             hash,
         )?;
-        let mut keying_material = ArrayVec::new();
-        keying_material
-            .try_extend_from_slice(out)
-            .map_err(|_| CryptoError::KeyingMaterialTooLong)?;
-
-        Ok(keying_material)
+        Ok(KeyingMaterial::from_export(out))
     }
 
     /// Signature algorithm for the configured private key.

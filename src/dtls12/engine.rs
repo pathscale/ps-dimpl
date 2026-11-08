@@ -3,9 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use zeroize::{Zeroize, Zeroizing};
+
 use super::queue::{QueueRx, QueueTx};
 use crate::buffer::{Buf, BufferPool, TmpBuf};
-use crate::crypto::{Aad, Iv, Nonce};
+use crate::crypto::{Aad, Iv, Nonce, SrtpProfile};
 use crate::dtls12::context::{AuthMode, CryptoContext};
 use crate::dtls12::incoming::{Incoming, Record, RecordHandler};
 use crate::dtls12::message::{Body, HashAlgorithm, Header, MessageType, ProtocolVersion, Sequence};
@@ -13,7 +15,7 @@ use crate::dtls12::message::{ContentType, DTLSRecord, Dtls12CipherSuite, Handsha
 use crate::error::bounded_error_len;
 use crate::timer::ExponentialBackoff;
 use crate::window::ReplayWindow;
-use crate::{Config, Error, InternalError, Output, SeededRng};
+use crate::{Config, CryptoError, Error, InternalError, KeyingMaterial, Output, SeededRng};
 
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
 
@@ -1075,6 +1077,21 @@ impl Engine {
         self.flight_timeout = Timeout::Disabled;
         self.flight_dupe_timeout = Timeout::Disabled;
         self.connect_timeout = Timeout::Disabled;
+    }
+
+    pub(crate) fn extract_srtp_keying_material(
+        &mut self,
+        profile: SrtpProfile,
+    ) -> Result<KeyingMaterial, CryptoError> {
+        // The cipher suite has been negotiated before either role exports SRTP keys.
+        let hash = self.cipher_suite().unwrap().hash_algorithm();
+        let mut scratch = Zeroizing::new(self.pop_buffer());
+        let material = self
+            .crypto_context
+            .extract_srtp_keying_material(profile, hash, &mut scratch);
+        scratch.zeroize();
+        self.push_buffer(mem::take(&mut *scratch));
+        material
     }
 
     /// Pop a buffer from the buffer pool for temporary use

@@ -4,6 +4,8 @@
 //! This module provides generic implementations so that crypto backends only
 //! need to implement [`HmacProvider`]; no separate PRF or HKDF providers.
 
+use zeroize::Zeroizing;
+
 use crate::CryptoError;
 use crate::buffer::Buf;
 use crate::types::HashAlgorithm;
@@ -31,16 +33,17 @@ pub fn prf_tls12(
     scratch: &mut Buf,
     hash: HashAlgorithm,
 ) -> Result<(), CryptoError> {
-    let mut hmac_a = [0u8; MAX_HASH_LEN];
+    let mut hmac_a = Zeroizing::new([0u8; MAX_HASH_LEN]);
 
     // Build label + seed
     scratch.clear();
+    scratch.reserve(MAX_HASH_LEN + label.len() + seed.len());
     scratch.extend_from_slice(label.as_bytes());
     scratch.extend_from_slice(seed);
     let label_seed = scratch.as_ref();
 
     // A(1) = HMAC(secret, label_seed)
-    let hash_len = hmac.hmac(hash, secret, label_seed, &mut hmac_a)?;
+    let hash_len = hmac.hmac(hash, secret, label_seed, &mut hmac_a[..])?;
 
     // Build payload = A(i) || label || seed
     scratch.clear();
@@ -50,10 +53,11 @@ pub fn prf_tls12(
     let payload = scratch.as_mut();
 
     out.clear();
+    out.reserve(output_len);
+    let mut hmac_block = Zeroizing::new([0u8; MAX_HASH_LEN]);
     while out.len() < output_len {
         // P(i) = HMAC(secret, A(i) || label || seed)
-        let mut hmac_block = [0u8; MAX_HASH_LEN];
-        let block_len = hmac.hmac(hash, secret, payload, &mut hmac_block)?;
+        let block_len = hmac.hmac(hash, secret, payload, &mut hmac_block[..])?;
 
         let remaining = output_len - out.len();
         let to_copy = remaining.min(block_len);
@@ -61,7 +65,7 @@ pub fn prf_tls12(
 
         if out.len() < output_len {
             // A(i+1) = HMAC(secret, A(i))
-            hmac.hmac(hash, secret, &payload[..hash_len], &mut hmac_a)?;
+            hmac.hmac(hash, secret, &payload[..hash_len], &mut hmac_a[..])?;
             payload[..hash_len].copy_from_slice(&hmac_a[..hash_len]);
         }
     }
@@ -92,8 +96,8 @@ pub fn hkdf_extract(
         salt
     };
 
-    let mut prk = [0u8; MAX_HASH_LEN];
-    let prk_len = hmac.hmac(hash, actual_salt, ikm, &mut prk)?;
+    let mut prk = Zeroizing::new([0u8; MAX_HASH_LEN]);
+    let prk_len = hmac.hmac(hash, actual_salt, ikm, &mut prk[..])?;
     out.extend_from_slice(&prk[..prk_len]);
     Ok(())
 }
@@ -113,17 +117,20 @@ pub fn hkdf_expand(
         return Err(CryptoError::HkdfOutputTooLong);
     }
 
-    let mut t_prev = [0u8; MAX_HASH_LEN];
+    let mut t_prev = Zeroizing::new([0u8; MAX_HASH_LEN]);
     let mut t_prev_len = 0usize;
+    let mut input = Zeroizing::new(Vec::new());
 
     out.clear();
+    out.reserve(output_len);
     for i in 1..=n {
-        let mut input = Vec::with_capacity(t_prev_len + info.len() + 1);
+        input.clear();
+        input.reserve(MAX_HASH_LEN + info.len() + 1);
         input.extend_from_slice(&t_prev[..t_prev_len]);
         input.extend_from_slice(info);
         input.push(i as u8);
 
-        t_prev_len = hmac.hmac(hash, prk, &input, &mut t_prev)?;
+        t_prev_len = hmac.hmac(hash, prk, &input, &mut t_prev[..])?;
 
         let remaining = output_len - out.len();
         let to_copy = remaining.min(t_prev_len);

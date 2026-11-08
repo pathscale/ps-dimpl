@@ -1090,31 +1090,15 @@ impl State {
 
         // Emit SRTP keying material if negotiated
         if let Some(profile) = server.negotiated_srtp_profile {
-            let suite_hash = server.engine.cipher_suite().unwrap().hash_algorithm();
-            let mut out = server.engine.pop_buffer();
-            let mut scratch = server.engine.pop_buffer();
-            if let Ok(keying_material) = server
-                .engine
-                .crypto_context()
-                .extract_srtp_keying_material(profile, suite_hash, &mut out, &mut scratch)
-            {
-                server.engine.push_buffer(out);
-                server.engine.push_buffer(scratch);
+            if let Ok(keying_material) = server.engine.extract_srtp_keying_material(profile) {
                 debug!(
                     "SRTP keying material extracted ({} bytes) for profile: {:?}",
                     keying_material.len(),
                     profile
                 );
-                // expect should be correct here since we negotiated the profile
-                let profile = server
-                    .negotiated_srtp_profile
-                    .expect("SRTP profile should be negotiated");
                 server
                     .local_events
                     .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-            } else {
-                server.engine.push_buffer(out);
-                server.engine.push_buffer(scratch);
             }
         }
 

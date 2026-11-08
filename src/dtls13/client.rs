@@ -127,11 +127,11 @@ pub struct Client {
     server_hs_traffic_secret: Option<Buf>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum LocalEvent {
     PeerCert,
     Connected,
-    KeyingMaterial(ArrayVec<u8, 88>, SrtpProfile),
+    KeyingMaterial(KeyingMaterial, SrtpProfile),
 }
 
 impl Client {
@@ -1072,9 +1072,7 @@ impl State {
 
         // Extract and emit SRTP keying material if negotiated
         if let Some(profile) = client.negotiated_srtp_profile {
-            if let Ok((keying_material, profile)) =
-                client.engine.extract_srtp_keying_material(profile)
-            {
+            if let Ok(keying_material) = client.engine.extract_srtp_keying_material(profile) {
                 debug!(
                     "SRTP keying material extracted ({} bytes) for profile: {:?}",
                     keying_material.len(),
@@ -1583,9 +1581,7 @@ impl LocalEvent {
                 Output::PeerCert(&buf[..l])
             }
             LocalEvent::Connected => Output::Connected,
-            LocalEvent::KeyingMaterial(m, profile) => {
-                Output::KeyingMaterial(KeyingMaterial::new(&m), profile)
-            }
+            LocalEvent::KeyingMaterial(m, profile) => Output::KeyingMaterial(m, profile),
         }
     }
 }

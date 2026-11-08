@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
+use zeroize::Zeroize;
+
 /// Buffer pool for reusing allocated buffers.
 ///
 /// This pool manages a collection of reusable `Buf` instances to reduce allocations
@@ -75,6 +77,11 @@ impl Buf {
         self.data.clear();
     }
 
+    /// Reserve space for additional bytes.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.data.reserve(additional);
+    }
+
     /// Extend the buffer with a slice of bytes.
     pub fn extend_from_slice(&mut self, other: &[u8]) {
         self.data.extend_from_slice(other);
@@ -93,6 +100,12 @@ impl Buf {
     /// Convert the buffer into the underlying `Vec<u8>`.
     pub fn into_vec(self) -> Vec<u8> {
         self.data
+    }
+}
+
+impl Zeroize for Buf {
+    fn zeroize(&mut self) {
+        self.data.zeroize();
     }
 }
 

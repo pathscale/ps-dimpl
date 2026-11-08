@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
+use zeroize::Zeroizing;
 
 use super::queue::{QueueRx, QueueTx};
 use crate::buffer::{Buf, BufferPool, TmpBuf};
@@ -13,6 +14,7 @@ use crate::crypto::Cipher;
 use crate::crypto::HmacProvider;
 use crate::crypto::Nonce;
 use crate::crypto::SigningKey;
+use crate::crypto::SrtpProfile;
 use crate::crypto::SupportedDtls13CipherSuite;
 use crate::crypto::SupportedKxGroup;
 use crate::crypto::prf_hkdf;
@@ -29,7 +31,7 @@ use crate::dtls13::message::Sequence;
 use crate::timer::ExponentialBackoff;
 use crate::types::{HashAlgorithm, Random};
 use crate::window::ReplayWindow;
-use crate::{Config, DtlsCertificate, Error, InternalError, Output, SeededRng};
+use crate::{Config, DtlsCertificate, Error, InternalError, KeyingMaterial, Output, SeededRng};
 
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
 
@@ -148,7 +150,7 @@ pub struct Engine {
     release_app_data: bool,
 
     /// Exporter master secret for TLS 1.3 exporters (RFC 8446 Section 7.5).
-    exporter_master_secret: Option<Buf>,
+    exporter_master_secret: Option<Zeroizing<Buf>>,
 
     /// Number of AEAD encryptions on the current application send keys.
     app_send_record_count: u64,
@@ -1329,6 +1331,7 @@ impl Engine {
     }
 
     pub fn release_application_data_retaining_handshake_keys(&mut self) {
+        self.exporter_master_secret = None;
         self.release_app_data = true;
         self.retire_stale_queue_entries();
         // A datagram admitted before Finished may also contain a handshake
@@ -1370,6 +1373,7 @@ impl Engine {
     /// Abort the connection: flush all queued output, retransmission state, and
     /// disable timers so that no further packets are emitted.
     pub fn abort(&mut self) {
+        self.exporter_master_secret = None;
         self.queue_tx.clear();
         self.flight_saved_records.clear();
         self.flight_timeout = Timeout::Disabled;
@@ -1736,7 +1740,7 @@ impl Engine {
         &mut self,
         handshake_secret: &[u8],
     ) -> Result<(Buf, Buf), Error> {
-        let mut exp_master = self.buffers_free.pop();
+        let mut exp_master = Zeroizing::new(self.buffers_free.pop());
         let mut c_ap_traffic = self.buffers_free.pop();
         let mut s_ap_traffic = self.buffers_free.pop();
         let hash = self.hash_algorithm();
@@ -1745,7 +1749,7 @@ impl Engine {
 
         // Derive-Secret(handshake_secret, "derived", "")
         let empty_hash = self.transcript_hash_of(b"");
-        let mut derived = Buf::new();
+        let mut derived = Zeroizing::new(Buf::new());
         prf_hkdf::hkdf_expand_label_dtls13(
             hmac,
             hash,
@@ -1760,7 +1764,7 @@ impl Engine {
         // master_secret = HKDF-Extract(derived, 0)
         let zeros = [0u8; 48];
         let zeros = &zeros[..hash_len];
-        let mut master_secret = Buf::new();
+        let mut master_secret = Zeroizing::new(Buf::new());
         prf_hkdf::hkdf_extract(hmac, hash, &derived, zeros, &mut master_secret)
             .map_err(Error::CryptoError)?;
 
@@ -2210,30 +2214,29 @@ impl Engine {
     // =========================================================================
 
     pub fn extract_srtp_keying_material(
-        &self,
-        profile: crate::crypto::SrtpProfile,
-    ) -> Result<(ArrayVec<u8, 88>, crate::crypto::SrtpProfile), Error> {
-        let hash = self.hash_algorithm();
-        let hash_len = hash.output_len();
-        let hmac = self.hmac();
-
+        &mut self,
+        profile: SrtpProfile,
+    ) -> Result<KeyingMaterial, Error> {
         let exp_master = self
             .exporter_master_secret
-            .as_ref()
+            .take()
             .ok_or(Error::CryptoError(
                 crate::CryptoError::ExporterMasterSecretNotDerived,
             ))?;
 
+        let hash = self.hash_algorithm();
+        let hash_len = hash.output_len();
+        let hmac = self.hmac();
         let total_len = profile.keying_material_len();
 
         // RFC 8446 Section 7.5:
         // 1. derived_secret = Derive-Secret(exporter_master_secret, label, "")
         let empty_hash = self.transcript_hash_of(b"");
-        let mut derived = Buf::new();
+        let mut derived = Zeroizing::new(Buf::new());
         prf_hkdf::hkdf_expand_label_dtls13(
             hmac,
             hash,
-            exp_master,
+            &exp_master,
             b"EXTRACTOR-dtls_srtp",
             &empty_hash,
             &mut derived,
@@ -2243,24 +2246,19 @@ impl Engine {
 
         // 2. result = HKDF-Expand-Label(derived_secret, "exporter", Hash(context), length)
         let context_hash = self.transcript_hash_of(b"");
-        let mut keying_material_buf = Buf::new();
+        let mut keying_material = Zeroizing::new(Buf::new());
         prf_hkdf::hkdf_expand_label_dtls13(
             hmac,
             hash,
             &derived,
             b"exporter",
             &context_hash,
-            &mut keying_material_buf,
+            &mut keying_material,
             total_len,
         )
         .map_err(Error::CryptoError)?;
 
-        let mut keying_material = ArrayVec::new();
-        for &b in keying_material_buf.iter().take(total_len) {
-            keying_material.push(b);
-        }
-
-        Ok((keying_material, profile))
+        Ok(KeyingMaterial::from_export(keying_material))
     }
 
     pub fn random(&mut self) -> Random {

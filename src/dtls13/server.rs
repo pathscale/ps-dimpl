@@ -1157,9 +1157,7 @@ impl State {
 
         // Extract and emit SRTP keying material if negotiated
         if let Some(profile) = server.negotiated_srtp_profile {
-            if let Ok((keying_material, profile)) =
-                server.engine.extract_srtp_keying_material(profile)
-            {
+            if let Ok(keying_material) = server.engine.extract_srtp_keying_material(profile) {
                 debug!(
                     "SRTP keying material extracted ({} bytes) for profile: {:?}",
                     keying_material.len(),

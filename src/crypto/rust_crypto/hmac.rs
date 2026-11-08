@@ -2,6 +2,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha384};
+use zeroize::Zeroize;
 
 use super::super::HmacProvider;
 use crate::types::HashAlgorithm;
@@ -24,19 +25,21 @@ impl HmacProvider for RustCryptoHmacProvider {
                 let mut mac = Hmac::<Sha256>::new_from_slice(key)
                     .map_err(|_| CryptoError::OperationFailed(CryptoOperation::ComputeHmac))?;
                 mac.update(data);
-                let result = mac.finalize().into_bytes();
-                let len = result.len();
-                out[..len].copy_from_slice(&result);
-                Ok(len)
+                let out = &mut out[..hash.output_len()];
+                let mut result = mac.finalize().into_bytes();
+                out.copy_from_slice(&result);
+                result.as_mut_slice().zeroize();
+                Ok(out.len())
             }
             HashAlgorithm::SHA384 => {
                 let mut mac = Hmac::<Sha384>::new_from_slice(key)
                     .map_err(|_| CryptoError::OperationFailed(CryptoOperation::ComputeHmac))?;
                 mac.update(data);
-                let result = mac.finalize().into_bytes();
-                let len = result.len();
-                out[..len].copy_from_slice(&result);
-                Ok(len)
+                let out = &mut out[..hash.output_len()];
+                let mut result = mac.finalize().into_bytes();
+                out.copy_from_slice(&result);
+                result.as_mut_slice().zeroize();
+                Ok(out.len())
             }
             _ => Err(CryptoError::UnsupportedHmacHash(hash)),
         }
