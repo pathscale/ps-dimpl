@@ -499,7 +499,7 @@ impl Engine {
         let index = self
             .queue_rx
             .binary_search_by_key(&queue_order_key(&incoming), queue_order_key)
-            .unwrap_err();
+            .unwrap_or_else(|index| index);
         self.track_received_handshake_records(&incoming);
         self.queue_rx.insert(index, incoming);
         Ok(())
@@ -537,7 +537,7 @@ impl Engine {
             let index = self
                 .queue_rx
                 .binary_search_by_key(&key, queue_order_key)
-                .unwrap_err();
+                .unwrap_or_else(|index| index);
             if self.queue_rx.len() >= self.config.max_queue_rx() {
                 warn!(
                     "Receive queue full (max {}): {:?}",
