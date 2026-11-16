@@ -1360,8 +1360,9 @@ impl RecordHandler for Engine {
             }
 
             if !self.peer_encryption_enabled {
-                // Epoch >= 1 before peer encryption is enabled must stay queued
-                // for re-parsing after enable_peer_encryption().
+                // Epoch >= 1 before peer encryption is enabled reaches here only
+                // when an epoch-0 CCS precedes it in the same datagram; it must
+                // stay queued for re-parsing after enable_peer_encryption().
                 return Ok(Some(record));
             }
 
